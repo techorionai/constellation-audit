@@ -4,7 +4,7 @@ The service has two retention jobs. They use the retention runner of `constellat
 
 | Job | Table | Time column | Default period |
 | --- | ----- | ----------- | -------------- |
-| `audit_entries` | `audit_entries` | `time` (the time of the action) | 60 days |
+| `audit_entries` | `audit_entries` | `received_at` (the time of receipt) | 60 days |
 | `rejected_entries` | `rejected_entries` | `received_at` | 60 days |
 
 A job deletes the rows that are older than its period, in batches.
@@ -22,6 +22,6 @@ A job deletes the rows that are older than its period, in batches.
 
 Section 15 of `VISION.md` gives 60 days as the default period of the audit trail. A longer period can be necessary for a legal rule or a contract. The operator sets the period for the install. A shorter period than the rule is the responsibility of the operator.
 
-The retention job deletes by the time of the action. An entry with a `time` in the past, for example from a producer with a wrong clock, can be deleted at the first tick.
+The retention job deletes by the time of receipt (`received_at`). The time of receipt does not depend on a value of the producer. An entry that arrives late stays for the full period after its arrival, and an entry that has a wrong `time` cannot stay for ever. The intake also refuses an entry with a `time` more than 5 minutes after the time of receipt (reason `invalid_time`).
 
 The trigger on the tables refuses `UPDATE` and `TRUNCATE`, but not `DELETE`. The retention job needs `DELETE`.

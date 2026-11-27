@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/netip"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,8 +27,11 @@ const (
 	maxIPLen        = 45
 	maxUserAgentLen = 512
 	maxEventIDLen   = 128
-	specVersion     = "1.0"
-	typeSuffix      = ".audit.recorded"
+	// MaxFutureSkew is the maximum time that the time of an entry can be after
+	// the time of receipt. A larger value gives the reason invalid_time.
+	MaxFutureSkew = 5 * time.Minute
+	specVersion   = "1.0"
+	typeSuffix    = ".audit.recorded"
 )
 
 var (
@@ -142,6 +146,47 @@ type entryData struct {
 	UserAgent *string         `json:"userAgent"`
 }
 
+var (
+	envelopeMembers = []string{"specversion", "id", "source", "type", "time", "data", "actor", "actortype", "act", "acttype", "traceparent"}
+	dataMembers     = []string{"action", "result", "target", "summary", "details", "requestId", "ipAddress", "userAgent"}
+	targetMembers   = []string{"type", "id"}
+)
+
+// strictMembers checks the member names of the JSON object raw. The standard
+// decoder matches names with no regard to case and keeps the last duplicate.
+// This check refuses a duplicate name, and a name that is a known name with
+// another case. sub gives the known names of the members that are objects. It
+// returns true if raw is not an object, because the decoder gives that error.
+func strictMembers(raw []byte, known []string, sub map[string][]string) bool {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return true
+	}
+	seen := map[string]struct{}{}
+	for dec.More() {
+		tok, err := dec.Token()
+		name, ok := tok.(string)
+		if err != nil || !ok {
+			return true
+		}
+		if _, dup := seen[name]; dup {
+			return false
+		}
+		seen[name] = struct{}{}
+		if !slices.Contains(known, name) && slices.ContainsFunc(known, func(k string) bool { return strings.EqualFold(k, name) }) {
+			return false
+		}
+		var v json.RawMessage
+		if err := dec.Decode(&v); err != nil {
+			return true
+		}
+		if k, ok := sub[name]; ok && !strictMembers(v, k, nil) {
+			return false
+		}
+	}
+	return true
+}
+
 func validPrincipalType(s string) bool {
 	switch s {
 	case "user", "agent", "service", "workflow":
@@ -155,10 +200,16 @@ func runes(s string) int { return utf8.RuneCountInString(s) }
 // ParseEntry checks the CloudEvent of a stream message and makes the entry. app
 // is the app of the stream key. It is the trusted source of the service. The
 // error is a *RejectedError with the reason code when the entry breaks a rule.
-// The decoder ignores unknown members of the envelope and of data.
-func ParseEntry(app string, payload []byte) (Entry, error) {
+// The decoder ignores unknown members of the envelope and of data. A duplicate
+// member name, and a name of a known member with another case, give the reason
+// invalid_json. now is the time of receipt. An entry with a time more than
+// MaxFutureSkew after now gives the reason invalid_time.
+func ParseEntry(app string, payload []byte, now time.Time) (Entry, error) {
 	if len(payload) > MaxEntryBytes {
 		return Entry{}, reject(ReasonTooLarge)
+	}
+	if !strictMembers(payload, envelopeMembers, map[string][]string{"data": dataMembers}) {
+		return Entry{}, reject(ReasonInvalidJSON)
 	}
 	var env envelope
 	if err := json.Unmarshal(payload, &env); err != nil {
@@ -185,6 +236,9 @@ func ParseEntry(app string, payload []byte) (Entry, error) {
 	}
 	t, err := time.Parse(time.RFC3339Nano, *env.Time)
 	if err != nil {
+		return Entry{}, reject(ReasonInvalidTime)
+	}
+	if t.After(now.Add(MaxFutureSkew)) {
 		return Entry{}, reject(ReasonInvalidTime)
 	}
 
@@ -240,6 +294,9 @@ func parseData(e *Entry, d *entryData, app string) error {
 	}
 	if !isNull(d.Target) {
 		var t targetData
+		if !strictMembers(d.Target, targetMembers, nil) {
+			return reject(ReasonInvalidJSON)
+		}
 		if json.Unmarshal(d.Target, &t) != nil || t.Type == nil || t.ID == nil ||
 			!targetTypePattern.MatchString(*t.Type) || runes(*t.ID) < 1 || runes(*t.ID) > maxTargetIDLen {
 			return reject(ReasonInvalidTarget)

@@ -67,11 +67,19 @@ func serve(stderr io.Writer) int {
 	}
 	slog.InfoContext(ctx, "the service is running", "public_addr", app.PublicAddr(), "admin_addr", app.AdminAddr())
 
-	<-ctx.Done()
+	var failure error
+	select {
+	case <-ctx.Done():
+	case failure = <-app.Failed():
+		slog.ErrorContext(ctx, "a listener stopped, the service stops", "error", failure)
+	}
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), shutdownTimeout)
 	defer cancel()
 	if err := app.Shutdown(sctx); err != nil {
 		slog.ErrorContext(ctx, "the service did not stop cleanly", "error", err)
+		return 1
+	}
+	if failure != nil {
 		return 1
 	}
 	return 0

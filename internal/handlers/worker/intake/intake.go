@@ -17,6 +17,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/techorionai/constellation-audit/internal/app/commands"
+	"github.com/techorionai/constellation-audit/internal/ports/entries"
 	"github.com/techorionai/constellation-audit/internal/ports/streams"
 )
 
@@ -30,6 +31,9 @@ const (
 	MaxRefresh     = 5 * time.Minute
 )
 
+// LagTimeout is the time limit of one read of the lag of a stream.
+const LagTimeout = 5 * time.Second
+
 // Values of the attribute outcome of the counter of entries.
 const outcomeError = "error"
 
@@ -39,12 +43,16 @@ const (
 	reasonAppsError       = "apps_error"
 	reasonConsumerError   = "consumer_error"
 	reasonConsumerStopped = "consumer_stopped"
+	reasonKnownAppsError  = "known_apps_error"
 )
 
 // Config is the config of the supervisor.
 type Config struct {
 	// Streams finds the producers and makes the consumers.
 	Streams streams.Streams
+	// Known keeps the apps that the intake found. The supervisor starts the
+	// consumers of the known apps before it reads the index of the producers.
+	Known entries.KnownApps
 	// Record stores one message.
 	Record executor.ExecutorWithReturn[commands.RecordEntry, commands.Outcome]
 	// Refresh is the time between two reads of the list of producers.
@@ -70,8 +78,8 @@ type Supervisor struct {
 
 // New makes the supervisor and its instruments.
 func New(cfg Config) (*Supervisor, error) {
-	if cfg.Streams == nil || cfg.Record == nil || cfg.Meter == nil {
-		return nil, errors.New("intake: the streams, the command, and the meter are required")
+	if cfg.Streams == nil || cfg.Known == nil || cfg.Record == nil || cfg.Meter == nil {
+		return nil, errors.New("intake: the streams, the known apps, the command, and the meter are required")
 	}
 	if cfg.Refresh <= 0 {
 		return nil, errors.New("intake: the refresh interval must be more than 0")
@@ -137,9 +145,21 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 }
 
-// Refresh reads the producers, starts a consumer for each new producer, and
-// reads the lag of each stream. The consumers run until ctx ends.
+// Refresh starts a consumer for each known app, reads the producers, starts a
+// consumer for each new producer and keeps it as a known app, and reads the lag
+// of each stream. The known apps come from the store, so a producer that fills
+// the index of the producers with forged names cannot push out the real apps
+// (R11). The consumers run until ctx ends.
 func (s *Supervisor) Refresh(ctx context.Context) {
+	known, err := s.cfg.Known.KnownApps(ctx, MaxConsumers)
+	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		s.problem(ctx, reasonKnownAppsError)
+		s.log.ErrorContext(ctx, "the intake cannot read the known apps", "error", err)
+	}
+	s.startNew(ctx, known)
 	apps, err := s.cfg.Streams.Apps(ctx)
 	switch {
 	case errors.Is(err, streams.ErrTooManyApps):
@@ -155,7 +175,25 @@ func (s *Supervisor) Refresh(ctx context.Context) {
 		return
 	}
 	s.startNew(ctx, apps)
+	s.remember(ctx, apps, known)
 	s.collectLag(ctx)
+}
+
+// remember keeps the apps that have a consumer and are not known yet. A failure
+// is tried again at the next refresh.
+func (s *Supervisor) remember(ctx context.Context, apps, known []string) {
+	for _, app := range apps {
+		if slices.Contains(known, app) || !slices.Contains(s.Started(), app) {
+			continue
+		}
+		if err := s.cfg.Known.RememberApp(ctx, app); err != nil {
+			if ctx.Err() == nil {
+				s.problem(ctx, reasonKnownAppsError)
+				s.log.ErrorContext(ctx, "the intake cannot keep a known app", "stream", app, "error", err)
+			}
+			return
+		}
+	}
 }
 
 func (s *Supervisor) problem(ctx context.Context, reason string) {
@@ -189,6 +227,11 @@ func (s *Supervisor) startNew(ctx context.Context, apps []string) {
 		go func() {
 			defer s.wg.Done()
 			if err := runner.Run(ctx); err != nil && ctx.Err() == nil {
+				// Forget the app, so that the next refresh starts a new
+				// consumer (R4).
+				s.mu.Lock()
+				delete(s.started, app)
+				s.mu.Unlock()
 				s.problem(ctx, reasonConsumerStopped)
 				s.log.ErrorContext(ctx, "an intake consumer stopped", "stream", app, "error", err)
 			}
@@ -201,7 +244,9 @@ func (s *Supervisor) collectLag(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		d, err := s.cfg.Streams.Lag(ctx, app)
+		lctx, cancel := context.WithTimeout(ctx, LagTimeout)
+		d, err := s.cfg.Streams.Lag(lctx, app)
+		cancel()
 		switch {
 		case errors.Is(err, streams.ErrNoGroup):
 			s.mu.Lock()
@@ -209,6 +254,10 @@ func (s *Supervisor) collectLag(ctx context.Context) {
 			s.mu.Unlock()
 			s.log.WarnContext(ctx, "the audit stream has no consumer group of the audit service", "stream", app)
 		case err != nil:
+			// An old value is wrong now, so the gauge has no value (R8).
+			s.mu.Lock()
+			delete(s.lags, app)
+			s.mu.Unlock()
 			if ctx.Err() == nil {
 				s.log.WarnContext(ctx, "the intake cannot read the lag of a stream", "stream", app, "error", err)
 			}

@@ -27,3 +27,12 @@ type Repository interface {
 	// stream and stream ID changes nothing.
 	InsertRejected(ctx context.Context, r domain.Rejected) error
 }
+
+// KnownApps keeps the apps whose audit streams the intake found. The store is
+// durable, so a restart of the service does not lose the apps.
+type KnownApps interface {
+	// KnownApps returns the sorted apps, a maximum of limit.
+	KnownApps(ctx context.Context, limit int) ([]string, error)
+	// RememberApp keeps an app. A second call with the same app changes nothing.
+	RememberApp(ctx context.Context, app string) error
+}

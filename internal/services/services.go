@@ -103,8 +103,14 @@ type App struct {
 	retentionWG   sync.WaitGroup
 
 	serveWG   sync.WaitGroup
+	failed    chan error
 	closeOnce sync.Once
 }
+
+// Failed returns a channel that gets the error of a listener that stopped with
+// an error. The process must stop then, because a service with no listener
+// serves nothing (R6).
+func (a *App) Failed() <-chan error { return a.failed }
 
 // PublicAddr returns the address of the public listener.
 func (a *App) PublicAddr() string { return a.pubL.Addr().String() }
@@ -126,7 +132,7 @@ func (c funcChecker) Check(context.Context) error { return c.fn() }
 func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err error) {
 	o := newOptions(opts)
 	log := o.log
-	a := &App{cfg: cfg, log: log}
+	a := &App{cfg: cfg, log: log, failed: make(chan error, 2)}
 	defer func() {
 		if err != nil {
 			a.release(context.WithoutCancel(ctx))
@@ -244,6 +250,10 @@ func (a *App) serve(srv *http.Server, l net.Listener, name string) {
 		defer a.serveWG.Done()
 		if err := srv.Serve(l); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			a.log.Error("server stopped", "server", name, "error", err)
+			select {
+			case a.failed <- fmt.Errorf("%s server: %w", name, err):
+			default:
+			}
 		}
 	}()
 }
@@ -341,6 +351,7 @@ func (a *App) startIntake(ctx context.Context, repo *postgres.Entries, o options
 	observe := []decorators.Option{decorators.WithLogger(a.log), decorators.WithMeterProvider(mp)}
 	sup, err := intake.New(intake.Config{
 		Streams: vkadapter.NewStreams(a.kv.Raw, a.cfg.Intake.Count, o.claimIdle, a.log, mp),
+		Known:   repo,
 		Record:  decorators.ApplyTracing(decorators.ApplyLogging(record, "RecordEntry", observe...), "RecordEntry", observe...),
 		Refresh: a.cfg.Intake.Refresh,
 		Meter:   mp.Meter("audit"),
@@ -365,7 +376,7 @@ func (a *App) startRetention(ctx context.Context, o options) error {
 	if err != nil {
 		return fmt.Errorf("make the retention locker: %w", err)
 	}
-	entries, err := retentionpg.NewTablePurger(a.db.Pool, retentionpg.TableSpec{Table: "audit_entries", TimeColumn: "time"})
+	entries, err := retentionpg.NewTablePurger(a.db.Pool, retentionpg.TableSpec{Table: "audit_entries", TimeColumn: "received_at"})
 	if err != nil {
 		return fmt.Errorf("make the entries purger: %w", err)
 	}

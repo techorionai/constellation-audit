@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/techorionai/constellation-platform-go/executor"
+	platformstreams "github.com/techorionai/constellation-platform-go/streams"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
@@ -40,6 +41,7 @@ func (s *syncBuffer) String() string {
 }
 
 type fixture struct {
+	known  *mock.Known
 	sup    *intake.Supervisor
 	reader *sdkmetric.ManualReader
 	logs   *syncBuffer
@@ -47,6 +49,7 @@ type fixture struct {
 
 func newFixture(t *testing.T, st *mock.Streams) *fixture {
 	t.Helper()
+	known := &mock.Known{}
 	reader := sdkmetric.NewManualReader()
 	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
 	logs := &syncBuffer{}
@@ -55,13 +58,13 @@ func newFixture(t *testing.T, st *mock.Streams) *fixture {
 			return commands.OutcomeStored, nil
 		})
 	sup, err := intake.New(intake.Config{
-		Streams: st, Record: record, Refresh: intake.MinRefresh,
+		Streams: st, Known: known, Record: record, Refresh: intake.MinRefresh,
 		Meter: mp.Meter("test"), Log: slog.New(slog.NewTextHandler(logs, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &fixture{sup: sup, reader: reader, logs: logs}
+	return &fixture{known: known, sup: sup, reader: reader, logs: logs}
 }
 
 // run starts the refresh loop of the supervisor and stops it at cleanup.
@@ -253,5 +256,154 @@ func TestNewChecks(t *testing.T) {
 	_, err := intake.New(intake.Config{})
 	if err == nil {
 		t.Fatal("an empty config must be an error")
+	}
+}
+
+// failingStreams is a mock whose first consumer stops with an error.
+type failingRunner struct{ err error }
+
+func (r failingRunner) Run(context.Context) error { return r.err }
+
+type flakyStreams struct {
+	*mock.Streams
+	mu    sync.Mutex
+	calls int
+}
+
+func (f *flakyStreams) NewConsumer(app string, h platformstreams.Handler) (streams.Runner, error) {
+	f.mu.Lock()
+	f.calls++
+	n := f.calls
+	f.mu.Unlock()
+	if n == 1 {
+		return failingRunner{err: errors.New("consumer failed")}, nil
+	}
+	return f.Streams.NewConsumer(app, h)
+}
+
+// R4: a consumer that stops with an error while the context is live gets a new
+// consumer at the next refresh.
+func TestConsumerRestartAfterError(t *testing.T) {
+	st := &mock.Streams{AppsFunc: func(context.Context) ([]string, error) { return []string{"a"}, nil }}
+	f := newFixture(t, st)
+	fs := &flakyStreams{Streams: st}
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	logs := &syncBuffer{}
+	sup, err := intake.New(intake.Config{
+		Streams: fs, Known: f.known, Refresh: intake.MinRefresh, Meter: mp.Meter("test"),
+		Record: executor.FuncWithReturn[commands.RecordEntry, commands.Outcome](
+			func(context.Context, commands.RecordEntry) (commands.Outcome, error) {
+				return commands.OutcomeStored, nil
+			}),
+		Log: slog.New(slog.NewTextHandler(logs, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup.Refresh(ctx)
+	waitFor(t, "the failed consumer leaves the started list", func() bool { return len(sup.Started()) == 0 })
+	sup.Refresh(ctx)
+	if got := sup.Started(); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("started = %v, want [a]", got)
+	}
+	if got := st.Consumers(); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("consumers = %v, want the second consumer for a", got)
+	}
+	if !strings.Contains(logs.String(), "an intake consumer stopped") {
+		t.Fatalf("logs = %s", logs.String())
+	}
+}
+
+// R8: a Lag error removes the old value of the gauge, and a Lag call has a
+// time limit.
+func TestLagErrorClearsGauge(t *testing.T) {
+	fail := false
+	var limited bool
+	st := &mock.Streams{
+		AppsFunc: func(context.Context) ([]string, error) { return []string{"helpdesk"}, nil },
+		LagFunc: func(ctx context.Context, _ string) (time.Duration, error) {
+			_, limited = ctx.Deadline()
+			if fail {
+				return 0, errors.New("valkey slow")
+			}
+			return 3 * time.Second, nil
+		},
+	}
+	f := newFixture(t, st)
+	f.sup.Refresh(context.Background())
+	gauge := func() map[string]float64 {
+		got := map[string]float64{}
+		for _, sm := range f.collect(t).ScopeMetrics {
+			for _, m := range sm.Metrics {
+				if g, ok := m.Data.(metricdata.Gauge[float64]); ok && m.Name == "constellation.audit.intake.lag" {
+					for _, dp := range g.DataPoints {
+						v, _ := dp.Attributes.Value("stream")
+						got[v.AsString()] = dp.Value
+					}
+				}
+			}
+		}
+		return got
+	}
+	if got := gauge(); got["helpdesk"] != 3 {
+		t.Fatalf("gauge = %v, want helpdesk=3", got)
+	}
+	fail = true
+	f.sup.Refresh(context.Background())
+	if got := gauge(); len(got) != 0 {
+		t.Fatalf("gauge = %v, want no value after a Lag error", got)
+	}
+	if !limited {
+		t.Fatal("the Lag call has no time limit")
+	}
+}
+
+// R11: the supervisor starts the consumers of the known apps before and with no
+// regard to the index of the producers. With a list from Apps that has forged
+// apps only, the real apps keep their consumers. A new app is remembered once.
+func TestKnownAppsStartFirst(t *testing.T) {
+	order := []string{}
+	var mu sync.Mutex
+	st := &mock.Streams{AppsFunc: func(context.Context) ([]string, error) {
+		mu.Lock()
+		order = append(order, "apps")
+		mu.Unlock()
+		return []string{"forged1", "new"}, fmt.Errorf("%w: more", streams.ErrTooManyApps)
+	}}
+	f := newFixture(t, st)
+	f.known.ListFunc = func(context.Context) ([]string, error) {
+		mu.Lock()
+		order = append(order, "known")
+		mu.Unlock()
+		return []string{"crm", "helpdesk"}, nil
+	}
+	f.sup.Refresh(context.Background())
+	f.sup.Refresh(context.Background())
+	if got := st.Consumers(); !slices.Equal(got, []string{"crm", "helpdesk", "forged1", "new"}) {
+		t.Fatalf("consumers = %v, want the known apps first", got)
+	}
+	if !slices.Equal(order[:2], []string{"known", "apps"}) {
+		t.Fatalf("order = %v, the known apps must come first", order)
+	}
+	if got := f.known.Added(); !slices.Equal(got, []string{"forged1", "new", "forged1", "new"}) {
+		t.Fatalf("remembered = %v", got)
+	}
+}
+
+// R11: a failed read of the known apps is counted, and the refresh goes on with
+// the index of the producers.
+func TestKnownAppsError(t *testing.T) {
+	st := &mock.Streams{AppsFunc: func(context.Context) ([]string, error) { return []string{"a"}, nil }}
+	f := newFixture(t, st)
+	f.known.ListFunc = func(context.Context) ([]string, error) { return nil, errors.New("db down") }
+	f.sup.Refresh(context.Background())
+	if got := st.Consumers(); !slices.Equal(got, []string{"a"}) {
+		t.Fatalf("consumers = %v, want [a]", got)
+	}
+	if got := f.counter(t, "constellation.audit.intake.problems", "reason", "known_apps_error"); got != 1 {
+		t.Fatalf("known_apps_error count = %d, want 1", got)
 	}
 }

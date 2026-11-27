@@ -1,11 +1,15 @@
 package postgres
 
 import (
+	"context"
 	"errors"
+	"io"
+	"net"
 	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/puddle/v2"
 
 	"github.com/techorionai/constellation-audit/internal/ports/entries"
 )
@@ -33,8 +37,22 @@ func TestWrapUnavailableCodes(t *testing.T) {
 			t.Errorf("code %s: the error text has the message of the database", code)
 		}
 	}
-	if err := wrap("op", errors.New("closed")); !errors.Is(err, entries.ErrUnavailable) {
-		t.Error("an error with no code must be unavailable")
+	for name, in := range map[string]error{
+		"closed":      io.EOF,
+		"unexpected":  io.ErrUnexpectedEOF,
+		"timeout":     context.DeadlineExceeded,
+		"net":         &net.OpError{Op: "read", Err: errors.New("reset")},
+		"closed pool": puddle.ErrClosedPool,
+	} {
+		if err := wrap("op", in); !errors.Is(err, entries.ErrUnavailable) {
+			t.Errorf("%s: a connection error must be unavailable", name)
+		}
+	}
+	// R7: an error with no code that is not a connection error is a failure of
+	// the service. Its text stays out of the result.
+	err := wrap("op", errors.New("unable to encode SECRET-VALUE"))
+	if errors.Is(err, entries.ErrUnavailable) || errors.Is(err, entries.ErrDataRefused) || strings.Contains(err.Error(), "SECRET-VALUE") {
+		t.Errorf("a client side error must be a plain failure with no value: %v", err)
 	}
 	if wrap("op", nil) != nil {
 		t.Error("nil must stay nil")

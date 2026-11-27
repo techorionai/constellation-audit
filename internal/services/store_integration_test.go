@@ -38,51 +38,8 @@ func migratedDB(t *testing.T) *clientpg.Client {
 	return c
 }
 
-// I8: the lag gauge has a value for each stream that has the group audit, and
-// has no value for a stream without the group. A missing group does not stop the
-// refresh for the other streams.
-func TestI8_LagWithMissingGroup(t *testing.T) {
-	env.ResetAuditStreams(t)
-	helpdesk, crm := env.NewProducer(t, "helpdesk"), env.NewProducer(t, "crm")
-	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
-	crm.Write(t, audit.Entry{Action: "crm:contact:write", Result: audit.Success})
-	admin := env.ValkeyAdmin(t)
-	if err := admin.Do(context.Background(), admin.B().Arbitrary("XGROUP", "CREATE", helpdesk.StreamKey(), "audit", "0").Build()).Error(); err != nil {
-		t.Fatal(err)
-	}
-	time.Sleep(1100 * time.Millisecond)
-
-	user, pw := env.NewValkeyACLUser(t)
-	c := env.ValkeyClient(t, user, pw)
-	mp, reader := meterOf(t)
-	logger, logs := testserver.NewLogCapture()
-	record := executor.FuncWithReturn[commands.RecordEntry, commands.Outcome](
-		func(context.Context, commands.RecordEntry) (commands.Outcome, error) {
-			return commands.OutcomeStored, nil
-		})
-	sup, err := intake.New(intake.Config{
-		Streams: noConsumers{vkadapter.NewStreams(c, 100, 0, logger, mp)},
-		Record:  record, Refresh: time.Minute, Meter: mp.Meter("audit"), Log: logger,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	sup.Refresh(context.Background())
-
-	got := gaugeByStream(t, reader)
-	if v, ok := got["helpdesk"]; !ok || v <= 0 {
-		t.Fatalf("gauge = %v, want a value more than 0 for helpdesk", got)
-	}
-	if _, ok := got["crm"]; ok {
-		t.Fatalf("gauge = %v, want no value for crm", got)
-	}
-	if !strings.Contains(logs.Text(), "no consumer group") || !strings.Contains(logs.Text(), "crm") {
-		t.Fatalf("no warn record for the missing group: %s", logs.Text())
-	}
-}
-
 // noConsumers is the real streams adapter with consumers that do nothing, so
-// that no consumer makes the missing group again.
+// that no consumer makes a missing group again.
 type noConsumers struct{ streams.Streams }
 
 type idleRunner struct{}
@@ -93,9 +50,12 @@ func (noConsumers) NewConsumer(string, platformstreams.Handler) (streams.Runner,
 	return idleRunner{}, nil
 }
 
-// I8b: with the intake that cannot store (PostgreSQL stopped), the lag grows.
-// After the return of PostgreSQL, the lag goes to 0.
-func TestI8_LagGrowsAndFalls(t *testing.T) {
+// I8: the lag gauge of a stream grows while the intake cannot store (PostgreSQL
+// stopped). After the return of PostgreSQL, it goes to 0. Then the group of
+// helpdesk is deleted, and crm has no group yet: the gauge has no value for
+// them, and the refresh goes on. When crm gets its group, the gauge has a value
+// for crm only.
+func TestI8_Lag(t *testing.T) {
 	db, proxy := env.NewProxiedDB(t)
 	mp, reader := meterOf(t)
 	srv := started(t, testserver.WithDB(db), testserver.WithMeterProvider(mp))
@@ -121,6 +81,57 @@ func TestI8_LagGrowsAndFalls(t *testing.T) {
 			t.Fatalf("the lag is %v after 30 seconds, want 0", gaugeByStream(t, reader))
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+	srv.Stop()
+
+	// The service is stopped, so no consumer makes a missing group again.
+	crm := env.NewProducer(t, "crm")
+	crm.Write(t, audit.Entry{Action: "crm:contact:write", Result: audit.Success})
+	user, pw := env.NewValkeyACLUser(t)
+	c := env.ValkeyClient(t, user, pw)
+	mp2, reader2 := meterOf(t)
+	logger, logs := testserver.NewLogCapture()
+	record := executor.FuncWithReturn[commands.RecordEntry, commands.Outcome](
+		func(context.Context, commands.RecordEntry) (commands.Outcome, error) {
+			return commands.OutcomeStored, nil
+		})
+	sup, err := intake.New(intake.Config{
+		Streams: noConsumers{vkadapter.NewStreams(c, 100, 0, logger, mp2)},
+		Known:   postgres.New(pool(t, srv.DB)),
+		Record:  record, Refresh: time.Minute, Meter: mp2.Meter("audit"), Log: logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sup.Refresh(context.Background())
+	got := gaugeByStream(t, reader2)
+	if v, ok := got["helpdesk"]; !ok || v != 0 {
+		t.Fatalf("gauge = %v, want 0 for helpdesk", got)
+	}
+	if _, ok := got["crm"]; ok {
+		t.Fatalf("gauge = %v, want no value for crm", got)
+	}
+	if !strings.Contains(logs.Text(), "no consumer group") || !strings.Contains(logs.Text(), "crm") {
+		t.Fatalf("no warn record for the missing group: %s", logs.Text())
+	}
+
+	admin := env.ValkeyAdmin(t)
+	for _, cmd := range [][]string{
+		{"XGROUP", "DESTROY", p.StreamKey(), "audit"},
+		{"XGROUP", "CREATE", crm.StreamKey(), "audit", "0"},
+	} {
+		if err := admin.Do(context.Background(), admin.B().Arbitrary(cmd...).Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(1100 * time.Millisecond)
+	sup.Refresh(context.Background())
+	got = gaugeByStream(t, reader2)
+	if _, ok := got["helpdesk"]; ok {
+		t.Fatalf("gauge = %v, want no value for helpdesk after its group is gone", got)
+	}
+	if v, ok := got["crm"]; !ok || v <= 0 {
+		t.Fatalf("gauge = %v, want a value more than 0 for crm", got)
 	}
 }
 

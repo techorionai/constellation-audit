@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/techorionai/constellation-audit/internal/app/commands"
 	"github.com/techorionai/constellation-audit/internal/domain"
@@ -22,6 +23,9 @@ const badEvent = `{"specversion":"1.0","id":"0192f4c0-7b1a-7c3e-9a55-3f2d1c0b9a8
 	`"type":"helpdesk.audit.recorded","time":"2026-11-27T10:15:00Z","datacontenttype":"application/json",` +
 	`"actor":"usr_1","actortype":"user","data":{"action":"crm:ticket:write","result":"success","summary":"SECRET-SUMMARY"}}`
 
+// clock is a fixed clock, 5 minutes after the time of the test events.
+var clock = commands.WithClock(func() time.Time { return time.Date(2026, 11, 27, 10, 20, 0, 0, time.UTC) })
+
 // U4: a store that is not available gives an error. A failed insert into the
 // rejected store gives an error. A class 22 error of the store gives a
 // rejection with the reason store_refused and no error.
@@ -34,7 +38,7 @@ func TestU4_RecordEntry(t *testing.T) {
 		repo := &mock.Entries{InsertFunc: func(context.Context, domain.Entry) (bool, error) {
 			return false, entries.ErrUnavailable
 		}}
-		_, err := commands.NewRecordEntry(repo, log).Execute(context.Background(), cmd)
+		_, err := commands.NewRecordEntry(repo, log, clock).Execute(context.Background(), cmd)
 		if !errors.Is(err, entries.ErrUnavailable) {
 			t.Fatalf("error = %v", err)
 		}
@@ -47,7 +51,7 @@ func TestU4_RecordEntry(t *testing.T) {
 		boom := errors.New("boom")
 		repo := &mock.Entries{InsertRejectedFunc: func(context.Context, domain.Rejected) error { return boom }}
 		bad := commands.RecordEntry{Stream: "helpdesk", StreamID: "2-0", Payload: []byte(badEvent)}
-		if _, err := commands.NewRecordEntry(repo, log).Execute(context.Background(), bad); !errors.Is(err, boom) {
+		if _, err := commands.NewRecordEntry(repo, log, clock).Execute(context.Background(), bad); !errors.Is(err, boom) {
 			t.Fatalf("error = %v", err)
 		}
 	})
@@ -56,7 +60,7 @@ func TestU4_RecordEntry(t *testing.T) {
 		repo := &mock.Entries{InsertFunc: func(context.Context, domain.Entry) (bool, error) {
 			return false, entries.ErrDataRefused
 		}}
-		out, err := commands.NewRecordEntry(repo, log).Execute(context.Background(), cmd)
+		out, err := commands.NewRecordEntry(repo, log, clock).Execute(context.Background(), cmd)
 		if err != nil || out != commands.OutcomeRejected {
 			t.Fatalf("outcome = %q, error = %v", out, err)
 		}
@@ -70,7 +74,7 @@ func TestU4_RecordEntry(t *testing.T) {
 	t.Run("outcomes", func(t *testing.T) {
 		inserted := true
 		repo := &mock.Entries{InsertFunc: func(context.Context, domain.Entry) (bool, error) { return inserted, nil }}
-		h := commands.NewRecordEntry(repo, log)
+		h := commands.NewRecordEntry(repo, log, clock)
 		if out, err := h.Execute(context.Background(), cmd); err != nil || out != commands.OutcomeStored {
 			t.Fatalf("outcome = %q, error = %v", out, err)
 		}
@@ -92,5 +96,23 @@ func TestU4_RecordEntry(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "invalid_action") || !strings.Contains(logs.String(), "stream_id=3-0") {
 		t.Fatalf("the log record of a rejected entry has no reason or stream ID: %s", logs.String())
+	}
+}
+
+// R12: an entry with a time in the future goes to the rejected store with the
+// reason invalid_time, and the store gets no entry.
+func TestFutureTimeRejected(t *testing.T) {
+	repo := &mock.Entries{InsertFunc: func(context.Context, domain.Entry) (bool, error) {
+		t.Fatal("the store must not get an entry with a time in the future")
+		return false, nil
+	}}
+	future := strings.Replace(goodEvent, "2026-11-27T10:15:00Z", "9999-12-31T23:59:59Z", 1)
+	out, err := commands.NewRecordEntry(repo, nil, clock).Execute(context.Background(),
+		commands.RecordEntry{Stream: "helpdesk", StreamID: "9-0", Payload: []byte(future)})
+	if err != nil || out != commands.OutcomeRejected {
+		t.Fatalf("outcome = %q, error = %v", out, err)
+	}
+	if len(repo.Rejected) != 1 || repo.Rejected[0].Reason != domain.ReasonInvalidTime {
+		t.Fatalf("rejected = %+v", repo.Rejected)
 	}
 }

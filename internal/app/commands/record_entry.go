@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/techorionai/constellation-audit/internal/domain"
 	"github.com/techorionai/constellation-audit/internal/ports/entries"
@@ -39,14 +40,25 @@ type RecordEntry struct {
 type RecordEntryHandler struct {
 	repo entries.Repository
 	log  *slog.Logger
+	now  func() time.Time
 }
 
+// Option changes the handler. The options are for tests.
+type Option func(*RecordEntryHandler)
+
+// WithClock sets the clock of the handler. The default is time.Now.
+func WithClock(now func() time.Time) Option { return func(h *RecordEntryHandler) { h.now = now } }
+
 // NewRecordEntry makes the handler. A nil log means slog.Default.
-func NewRecordEntry(repo entries.Repository, log *slog.Logger) *RecordEntryHandler {
+func NewRecordEntry(repo entries.Repository, log *slog.Logger, opts ...Option) *RecordEntryHandler {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &RecordEntryHandler{repo: repo, log: log}
+	h := &RecordEntryHandler{repo: repo, log: log, now: time.Now}
+	for _, o := range opts {
+		o(h)
+	}
+	return h
 }
 
 // Execute checks the message and stores it. A message that breaks a rule, and
@@ -58,7 +70,7 @@ func NewRecordEntry(repo entries.Repository, log *slog.Logger) *RecordEntryHandl
 // No log record of this command has a value of the entry. A record of a
 // rejected message has the stream, the stream ID, and the reason code.
 func (h *RecordEntryHandler) Execute(ctx context.Context, cmd RecordEntry) (Outcome, error) {
-	e, err := domain.ParseEntry(cmd.Stream, cmd.Payload)
+	e, err := domain.ParseEntry(cmd.Stream, cmd.Payload, h.now())
 	if err != nil {
 		reason, ok := domain.AsRejected(err)
 		if !ok {

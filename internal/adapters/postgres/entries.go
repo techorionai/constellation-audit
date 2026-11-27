@@ -5,10 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/puddle/v2"
 
 	"github.com/techorionai/constellation-audit/internal/domain"
 	"github.com/techorionai/constellation-audit/internal/ports/entries"
@@ -34,8 +37,22 @@ func unavailableCode(code string) bool {
 		code == "57P01" || code == "57P02" || code == "57P03"
 }
 
-// wrap maps an error of the driver. An error with no PostgreSQL code (a closed
-// connection, a refused connection, a timeout) and an error with a code of
+// connectionError tells whether an error with no PostgreSQL code comes from the
+// connection: a network error, a refused connection, a timeout, a closed
+// connection, or a closed pool. Other errors with no code, for example an
+// encode error of a value on the client side, come from the data or from the
+// service, so a retry cannot help.
+func connectionError(err error) bool {
+	var netErr net.Error
+	var connErr *pgconn.ConnectError
+	return errors.As(err, &netErr) || errors.As(err, &connErr) || pgconn.Timeout(err) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) ||
+		errors.Is(err, puddle.ErrClosedPool) || errors.Is(err, puddle.ErrNotAvailable)
+}
+
+// wrap maps an error of the driver. A connection error with no PostgreSQL code
+// (see connectionError) and an error with a code of
 // class 08, class 53, or 57P01 to 57P03 is an unavailable store. An error of
 // class 22 (data exception) comes from the data, so it is a refusal of the
 // data. Each other error with a code is a failure of the service.
@@ -49,7 +66,11 @@ func wrap(op string, err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if !errors.As(err, &pgErr) {
-		return fmt.Errorf("%s: %w: %w", op, entries.ErrUnavailable, err)
+		if connectionError(err) {
+			return fmt.Errorf("%s: %w: %w", op, entries.ErrUnavailable, err)
+		}
+		// The text of this error can hold a value of the entry, so it stays out.
+		return fmt.Errorf("%s: driver error of type %T", op, err)
 	}
 	switch {
 	case unavailableCode(pgErr.Code):
@@ -95,4 +116,30 @@ func nullable(s string) *string {
 		return nil
 	}
 	return &s
+}
+
+var _ entries.KnownApps = (*Entries)(nil)
+
+// KnownApps returns the sorted apps that the intake found, a maximum of limit.
+func (r *Entries) KnownApps(ctx context.Context, limit int) ([]string, error) {
+	rows, err := r.pool.Query(ctx, `SELECT app FROM known_apps ORDER BY app LIMIT $1`, limit)
+	if err != nil {
+		return nil, wrap("list known apps", err)
+	}
+	defer rows.Close()
+	var apps []string
+	for rows.Next() {
+		var app string
+		if err := rows.Scan(&app); err != nil {
+			return nil, wrap("scan known app", err)
+		}
+		apps = append(apps, app)
+	}
+	return apps, wrap("list known apps", rows.Err())
+}
+
+// RememberApp keeps an app. A second call with the same app changes nothing.
+func (r *Entries) RememberApp(ctx context.Context, app string) error {
+	_, err := r.pool.Exec(ctx, `INSERT INTO known_apps (app) VALUES ($1) ON CONFLICT (app) DO NOTHING`, app)
+	return wrap("remember app", err)
 }

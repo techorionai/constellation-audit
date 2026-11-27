@@ -96,3 +96,42 @@ func (m *Streams) Consumers() []string {
 	defer m.mu.Unlock()
 	return append([]string(nil), m.consumers...)
 }
+
+var _ entries.KnownApps = (*Known)(nil)
+
+// Known is a mock of the port of the known apps. A nil function does nothing.
+type Known struct {
+	ListFunc func(ctx context.Context) ([]string, error)
+	AddFunc  func(ctx context.Context, app string) error
+
+	mu    sync.Mutex
+	added []string
+}
+
+// KnownApps calls ListFunc.
+func (m *Known) KnownApps(ctx context.Context, _ int) ([]string, error) {
+	if m.ListFunc == nil {
+		return nil, nil
+	}
+	return m.ListFunc(ctx)
+}
+
+// RememberApp calls AddFunc and keeps the app.
+func (m *Known) RememberApp(ctx context.Context, app string) error {
+	if m.AddFunc != nil {
+		if err := m.AddFunc(ctx, app); err != nil {
+			return err
+		}
+	}
+	m.mu.Lock()
+	m.added = append(m.added, app)
+	m.mu.Unlock()
+	return nil
+}
+
+// Added returns the apps that the intake remembered, in the order of the calls.
+func (m *Known) Added() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.added...)
+}

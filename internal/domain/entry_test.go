@@ -4,9 +4,14 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/techorionai/constellation-audit/internal/domain"
 )
+
+// testNow is the time of receipt in the tests. The entry time is 5 minutes
+// before it.
+var testNow = time.Date(2026, 11, 27, 10, 20, 0, 0, time.UTC)
 
 const (
 	validID     = "0192f4c0-7b1a-7c3e-9a55-3f2d1c0b9a88"
@@ -55,7 +60,7 @@ func TestU1_ValidEntries(t *testing.T) {
 		data["ipAddress"] = "2001:db8::1"
 		data["userAgent"] = "Mozilla/5.0"
 	})
-	e, err := domain.ParseEntry("helpdesk", full)
+	e, err := domain.ParseEntry("helpdesk", full, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +73,7 @@ func TestU1_ValidEntries(t *testing.T) {
 		t.Fatalf("entry = %+v", e)
 	}
 
-	e, err = domain.ParseEntry("helpdesk", event(t, nil))
+	e, err = domain.ParseEntry("helpdesk", event(t, nil), testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,6 +101,13 @@ func TestU2_BadRules(t *testing.T) {
 		{name: "id not a UUID", change: func(env, _ map[string]any) { env["id"] = "e1" }, want: domain.ReasonInvalidID},
 		{name: "id in upper case", change: func(env, _ map[string]any) { env["id"] = strings.ToUpper(validID) }, want: domain.ReasonInvalidID},
 		{name: "no time", change: func(env, _ map[string]any) { delete(env, "time") }, want: domain.ReasonInvalidTime},
+		{name: "time 6 minutes in the future", change: func(env, _ map[string]any) { env["time"] = "2026-11-27T10:26:00Z" }, want: domain.ReasonInvalidTime},
+		{name: "time in the year 9999", change: func(env, _ map[string]any) { env["time"] = "9999-12-31T23:59:59Z" }, want: domain.ReasonInvalidTime},
+		{name: "duplicate member of data", raw: []byte(`{"specversion":"1.0","data":{"action":"a","action":"b"}}`), want: domain.ReasonInvalidJSON},
+		{name: "duplicate member of envelope", raw: []byte(`{"id":"a","id":"b","data":{}}`), want: domain.ReasonInvalidJSON},
+		{name: "envelope member in other case", raw: []byte(`{"Source":"/helpdesk","data":{}}`), want: domain.ReasonInvalidJSON},
+		{name: "data member in other case", raw: []byte(`{"data":{"Action":"helpdesk:ticket:write"}}`), want: domain.ReasonInvalidJSON},
+		{name: "target member in other case", change: func(_, d map[string]any) { d["target"] = map[string]any{"Type": "ticket", "id": "1"} }, want: domain.ReasonInvalidJSON},
 		{name: "bad time", change: func(env, _ map[string]any) { env["time"] = "yesterday" }, want: domain.ReasonInvalidTime},
 		{name: "no actor", change: func(env, _ map[string]any) { delete(env, "actor") }, want: domain.ReasonInvalidActor},
 		{name: "actor type", change: func(env, _ map[string]any) { env["actortype"] = "robot" }, want: domain.ReasonInvalidActor},
@@ -128,7 +140,7 @@ func TestU2_BadRules(t *testing.T) {
 			if payload == nil {
 				payload = event(t, tc.change)
 			}
-			_, err := domain.ParseEntry("helpdesk", payload)
+			_, err := domain.ParseEntry("helpdesk", payload, testNow)
 			if got := reasonOf(t, err); got != tc.want {
 				t.Fatalf("reason = %s, want %s", got, tc.want)
 			}
@@ -139,7 +151,7 @@ func TestU2_BadRules(t *testing.T) {
 	}
 
 	// A full CloudEvent of exactly 64 KiB passes the size check.
-	_, err := domain.ParseEntry("helpdesk", make([]byte, domain.MaxEntryBytes))
+	_, err := domain.ParseEntry("helpdesk", make([]byte, domain.MaxEntryBytes), testNow)
 	if got := reasonOf(t, err); got == domain.ReasonTooLarge {
 		t.Fatal("a payload of exactly the limit is not too large")
 	}
@@ -151,7 +163,7 @@ func TestU3_UnknownMembers(t *testing.T) {
 		env["foo"] = "x"
 		data["foo"] = map[string]any{"a": 1}
 	})
-	e, err := domain.ParseEntry("helpdesk", payload)
+	e, err := domain.ParseEntry("helpdesk", payload, testNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,5 +195,13 @@ func TestEventID(t *testing.T) {
 		if got := domain.EventID([]byte(in)); got != "" {
 			t.Fatalf("%s: id = %q, want empty", in, got)
 		}
+	}
+}
+
+// R12: an entry with a time up to 5 minutes after the time of receipt passes.
+func TestFutureSkewLimit(t *testing.T) {
+	ok := event(t, func(env, _ map[string]any) { env["time"] = "2026-11-27T10:25:00Z" })
+	if _, err := domain.ParseEntry("helpdesk", ok, testNow); err != nil {
+		t.Fatalf("a time at the limit must pass: %v", err)
 	}
 }

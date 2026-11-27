@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -282,8 +283,9 @@ func TestI11_TwoInstances(t *testing.T) {
 	}
 }
 
-// I13: the retention jobs delete the old entry and the old rejected entry. The
-// new entry stays.
+// I13: the retention jobs delete the entry and the rejected entry that arrived
+// long ago. The entry that arrived now stays, also if its time is old (R5). An
+// entry with a time in the future never gets in (R12).
 func TestI13_Retention(t *testing.T) {
 	var calls atomic.Int32
 	fire := make(chan struct{})
@@ -302,10 +304,13 @@ func TestI13_Retention(t *testing.T) {
 		cfg.Retention.RejectedEntries.Period = time.Second
 	}))
 	db := pool(t, srv.DB)
-	insert := `INSERT INTO audit_entries (entry_id, service, time, action, result, actor, actor_type)
-		VALUES (gen_random_uuid(), 'helpdesk', $1, 'helpdesk:ticket:write', 'success', 'usr_1', 'user')`
-	for _, ts := range []time.Time{time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC), time.Now().Add(time.Hour)} {
-		if _, err := db.Exec(context.Background(), insert, ts); err != nil {
+	insert := `INSERT INTO audit_entries (entry_id, service, time, received_at, action, result, actor, actor_type)
+		VALUES (gen_random_uuid(), 'helpdesk', $1, $2, 'helpdesk:ticket:write', 'success', 'usr_1', 'user')`
+	old := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	// An old time with a new receipt time stays. A new time with an old receipt
+	// time goes.
+	for _, ts := range [][2]time.Time{{old, time.Now()}, {time.Now(), old}} {
+		if _, err := db.Exec(context.Background(), insert, ts[0], ts[1]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -316,8 +321,8 @@ func TestI13_Retention(t *testing.T) {
 	close(fire)
 	waitCount(t, db, 1, selectRows)
 	waitCount(t, db, 1, selectRejected)
-	if n := count(t, db, `SELECT count(*) FROM audit_entries WHERE time > now()`); n != 1 {
-		t.Fatalf("the new entry is gone")
+	if n := count(t, db, `SELECT count(*) FROM audit_entries WHERE time < '2021-01-01'`); n != 1 {
+		t.Fatalf("the entry with the old time and the new receipt time is gone")
 	}
 	if n := count(t, db, `SELECT count(*) FROM rejected_entries WHERE stream_id = '2-0'`); n != 1 {
 		t.Fatalf("the new rejected entry is gone")
@@ -394,5 +399,49 @@ func TestI16_EscapedNUL(t *testing.T) {
 	db := pool(t, srv.DB)
 	waitCount(t, db, 1, selectRows)
 	waitCount(t, db, 1, `SELECT count(*) FROM rejected_entries WHERE reason = 'invalid_text'`)
+	waitNoPending(t, p)
+}
+
+// I18 (R12): an entry with a time in the future goes to rejected_entries with
+// the reason invalid_time. The valid entry after it is stored.
+func TestI18_FutureTime(t *testing.T) {
+	srv := started(t)
+	p := env.NewProducer(t, "helpdesk")
+	future := rawEvent(t, "helpdesk", func(e, _ map[string]any) { e["time"] = "9999-12-31T23:59:59Z" })
+	p.PublishRaw(t, future, rawEvent(t, "helpdesk", nil))
+	db := pool(t, srv.DB)
+	waitCount(t, db, 1, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM rejected_entries WHERE reason = 'invalid_time'`)
+	waitNoPending(t, p)
+}
+
+// I19 (R11): a producer fills the index audit.streams with forged names, so
+// that the list of the apps has no real app. After the restart of the service,
+// the entries of the real app are stored, because the service keeps the known
+// apps in PostgreSQL.
+func TestI19_ForgedIndexAfterRestart(t *testing.T) {
+	db, _ := env.NewProxiedDB(t)
+	srv := started(t, testserver.WithDB(db))
+	p := env.NewProducer(t, "helpdesk")
+	p.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	waitCount(t, pool(t, srv.DB), 1, selectRows)
+	waitCount(t, pool(t, srv.DB), 1, `SELECT count(*) FROM known_apps WHERE app = 'helpdesk'`)
+	srv.Stop()
+
+	p.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	admin := env.ValkeyAdmin(t)
+	forged := []string{"SADD", "audit.streams"}
+	for i := range 10100 {
+		forged = append(forged, "f"+strconv.Itoa(100000+i))
+	}
+	for _, cmd := range [][]string{{"DEL", "audit.streams"}, forged} {
+		if err := admin.Do(context.Background(), admin.B().Arbitrary(cmd...).Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv2 := env.Start(t, testserver.WithDB(db))
+	srv2.WaitReady(t)
+	waitCount(t, pool(t, srv2.DB), 2, selectRows)
 	waitNoPending(t, p)
 }
