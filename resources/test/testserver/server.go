@@ -117,6 +117,7 @@ func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
 		},
 		Client: e.ClientConfig(s.client),
 		Intake: config.Intake{Refresh: s.intake, Count: config.DefaultIntakeCount},
+		Export: config.Export{MaxEntries: 100000, Concurrency: 2, Timeout: 10 * time.Minute},
 		Retention: config.Retention{
 			AuditEntries:    retention.Config{Interval: time.Hour, BatchSize: retention.DefaultBatchSize},
 			RejectedEntries: retention.Config{Interval: time.Hour, BatchSize: retention.DefaultBatchSize},
@@ -282,4 +283,42 @@ func (c *LogCapture) Records(action string) []map[string]any {
 		}
 	}
 	return out
+}
+
+// Open sends a GET request with a bearer token and the headers. It returns
+// the response when the headers arrive, before the service sends the body. The
+// caller must close the body. A token "" sends no Authorization header.
+func (s *Server) Open(t testing.TB, path, token string, header map[string]string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, s.PublicURL+path, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
+	// A transport of its own, so that the response of a test does not share a
+	// connection with another request.
+	tr := &http.Transport{DisableKeepAlives: true}
+	t.Cleanup(tr.CloseIdleConnections)
+	resp, err := (&http.Client{Transport: tr}).Do(req)
+	if err != nil {
+		t.Fatalf("testserver: GET %s: %v", path, err)
+	}
+	return resp
+}
+
+// DoHeader is Do for a GET request with more headers.
+func (s *Server) DoHeader(t testing.TB, path, token string, header map[string]string) Response {
+	t.Helper()
+	resp := s.Open(t, path, token, header)
+	defer func() { _ = resp.Body.Close() }()
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return Response{Status: resp.StatusCode, Header: resp.Header, Body: data}
 }

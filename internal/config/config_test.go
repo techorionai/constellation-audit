@@ -83,3 +83,49 @@ func TestMissingVariable(t *testing.T) {
 		t.Fatalf("error = %v", err)
 	}
 }
+
+// U8: the export variables and the pool rule. A bad value gives an error that
+// names the variable. MaxConns 8 with concurrency 2 is valid.
+func TestU8_ExportConfig(t *testing.T) {
+	setRequired(t)
+	bad := []struct {
+		name  string
+		env   map[string]string
+		wants string
+	}{
+		{"max entries 0", map[string]string{"AUDIT_EXPORT__MAX_ENTRIES": "0"}, "AUDIT_EXPORT__MAX_ENTRIES"},
+		{"max entries too large", map[string]string{"AUDIT_EXPORT__MAX_ENTRIES": "1000001"}, "AUDIT_EXPORT__MAX_ENTRIES"},
+		{"concurrency 17", map[string]string{"AUDIT_EXPORT__CONCURRENCY": "17"}, "AUDIT_EXPORT__CONCURRENCY"},
+		{"concurrency 0", map[string]string{"AUDIT_EXPORT__CONCURRENCY": "0"}, "AUDIT_EXPORT__CONCURRENCY"},
+		{"timeout 30s", map[string]string{"AUDIT_EXPORT__TIMEOUT": "30s"}, "AUDIT_EXPORT__TIMEOUT"},
+		{"timeout 2h", map[string]string{"AUDIT_EXPORT__TIMEOUT": "2h"}, "AUDIT_EXPORT__TIMEOUT"},
+		{"MaxConns 7 with concurrency 2", map[string]string{"AUDIT_DATABASE__MAX_CONNS": "7"}, "AUDIT_DATABASE__MAX_CONNS"},
+		{"MaxConns 9 with concurrency 3", map[string]string{"AUDIT_DATABASE__MAX_CONNS": "9", "AUDIT_EXPORT__CONCURRENCY": "3"}, "AUDIT_DATABASE__MAX_CONNS"},
+		{"bad trusted proxy", map[string]string{"AUDIT_HTTP__TRUSTED_PROXIES": "10.0.0.0/33"}, "AUDIT_HTTP__TRUSTED_PROXIES"},
+	}
+	for _, tc := range bad {
+		t.Run(tc.name, func(t *testing.T) {
+			for k, v := range tc.env {
+				t.Setenv(k, v)
+			}
+			_, err := config.Load()
+			if err == nil || !strings.Contains(err.Error(), tc.wants) {
+				t.Fatalf("error = %v, want one that names %s", err, tc.wants)
+			}
+		})
+	}
+
+	t.Setenv("AUDIT_DATABASE__MAX_CONNS", "8")
+	t.Setenv("AUDIT_HTTP__TRUSTED_PROXIES", "10.0.0.0/8, 192.168.0.0/16")
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Export.MaxEntries != 100000 || cfg.Export.Concurrency != 2 || cfg.Export.Timeout != 10*time.Minute {
+		t.Fatalf("export defaults = %+v", cfg.Export)
+	}
+	ci, err := cfg.HTTP.ClientInfo()
+	if err != nil || len(ci.TrustedProxies) != 2 {
+		t.Fatalf("trusted proxies = %v, err = %v", ci.TrustedProxies, err)
+	}
+}
