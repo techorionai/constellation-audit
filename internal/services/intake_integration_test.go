@@ -446,3 +446,85 @@ func TestI19_ForgedIndexAfterRestart(t *testing.T) {
 	waitCount(t, pool(t, srv2.DB), 2, selectRows)
 	waitNoPending(t, p)
 }
+
+// forgeApps adds forged app names that pass the pattern to audit.streams.
+func forgeApps(t *testing.T, n int) {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	for start := 0; start < n; start += 1000 {
+		cmd := []string{"SADD", "audit.streams"}
+		for i := start; i < min(start+1000, n); i++ {
+			cmd = append(cmd, "f"+strconv.Itoa(100000+i))
+		}
+		if err := admin.Do(context.Background(), admin.B().Arbitrary(cmd...).Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// audit.streams size as seen by the admin user.
+func indexSize(t *testing.T) int64 {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	n, err := admin.Do(context.Background(), admin.B().Scard().Key("audit.streams").Build()).AsInt64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// I20: a producer fills audit.streams with 12000 forged names. A new producer
+// that is not in known_apps is still found, and AuditApps deletes the forged
+// names. No too_many_apps problem is counted.
+func TestI20_ForgedIndexDoesNotHideNewProducer(t *testing.T) {
+	mp, reader := meterOf(t)
+	srv := started(t, testserver.WithMeterProvider(mp))
+	db := pool(t, srv.DB)
+	helpdesk := env.NewProducer(t, "helpdesk")
+	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	waitCount(t, db, 1, selectRows)
+	forgeApps(t, 12000)
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 2, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
+	deadline := time.Now().Add(30 * time.Second)
+	for indexSize(t) > 2 && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := indexSize(t); got > 2 {
+		t.Fatalf("audit.streams has %d members, want only the real apps", got)
+	}
+	if got := counter(t, reader, "constellation.audit.intake.problems", "reason", "too_many_apps"); got != 0 {
+		t.Fatalf("too_many_apps = %d, want 0", got)
+	}
+}
+
+// I21: the reader user has the v0.7.0 selectors, with no +srem. The service
+// works: a new producer is found and the forged names stay in the set. No
+// apps_error and no too_many_apps problem is counted.
+func TestI21_ReaderWithoutSrem(t *testing.T) {
+	const v070 = "(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange) (~audit.streams +sscan)"
+	mp, reader := meterOf(t)
+	srv := started(t, testserver.WithMeterProvider(mp), testserver.WithReaderSelectors(v070))
+	db := pool(t, srv.DB)
+	helpdesk := env.NewProducer(t, "helpdesk")
+	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	waitCount(t, db, 1, selectRows)
+	forgeApps(t, 5000)
+	before := indexSize(t)
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 2, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
+	// Wait for at least one more refresh, to see that nothing is deleted.
+	time.Sleep(1500 * time.Millisecond)
+	if got := indexSize(t); got < before {
+		t.Fatalf("audit.streams has %d members, want at least %d (no delete)", got, before)
+	}
+	for _, reason := range []string{"apps_error", "too_many_apps"} {
+		if got := counter(t, reader, "constellation.audit.intake.problems", "reason", reason); got != 0 {
+			t.Fatalf("%s = %d, want 0", reason, got)
+		}
+	}
+}
