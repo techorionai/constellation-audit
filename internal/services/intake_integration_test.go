@@ -59,7 +59,7 @@ func TestI1_StartupPublishesManifest(t *testing.T) {
 	// Identity gives a token for the audience audit only when it has the manifest.
 	token := env.Token(t, "reader-svc", "audit", readScope)
 	resp := srv.Do(t, http.MethodGet, "/v1/audit-entries", token, nil)
-	if resp.Status != http.StatusNotImplemented {
+	if resp.Status != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", resp.Status, resp.Body)
 	}
 }
@@ -202,19 +202,20 @@ func TestI7_EntriesBeforeStart(t *testing.T) {
 	waitCount(t, pool(t, srv.DB), 5, selectRows)
 }
 
-// I10: a token of reader-svc gives 501 on each route. A token without the scope
+// I10: a token of reader-svc gives 200 on the list and the export, and 404 on
+// the get of an unknown entry. A token without the scope
 // gives 403 with missingScopes. A token for another audience gives 401.
 func TestI10_Authorization(t *testing.T) {
 	srv := started(t)
-	routes := []string{
-		"/v1/audit-entries",
-		"/v1/audit-entries/export?format=csv",
-		"/v1/audit-entries/0192f4c0-7b1a-7c3e-9a55-3f2d1c0b9a88",
+	routes := map[string]int{
+		"/v1/audit-entries":                                      http.StatusOK,
+		"/v1/audit-entries/export?format=csv":                    http.StatusOK,
+		"/v1/audit-entries/0192f4c0-7b1a-7c3e-9a55-3f2d1c0b9a88": http.StatusNotFound,
 	}
 	reader := env.Token(t, "reader-svc", "audit", readScope)
-	for _, route := range routes {
+	for route, want := range routes {
 		resp := srv.Do(t, http.MethodGet, route, reader, nil)
-		if resp.Status != http.StatusNotImplemented || resp.Code(t) != "not_implemented" {
+		if resp.Status != want {
 			t.Fatalf("%s: status = %d, body = %s", route, resp.Status, resp.Body)
 		}
 		if resp := srv.Do(t, http.MethodGet, route, "", nil); resp.Status != http.StatusUnauthorized {
@@ -230,7 +231,7 @@ func TestI10_Authorization(t *testing.T) {
 	}
 
 	wrongAudience := env.Token(t, "audit", "identity", "identity:manifest:publish")
-	for _, route := range routes {
+	for route := range routes {
 		if resp := srv.Do(t, http.MethodGet, route, wrongAudience, nil); resp.Status != http.StatusUnauthorized {
 			t.Fatalf("%s with the audience identity: status = %d, want 401", route, resp.Status)
 		}

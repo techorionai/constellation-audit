@@ -2,7 +2,7 @@
 
 The audit service of the Constellation platform. It keeps an append-only audit trail for all services. Services write audit entries through their audit outbox and the Valkey streams `audit.stream:<app>`. The audit service reads the streams and stores each entry one time. It deletes entries after the retention period (60 days by default).
 
-This version has the intake and the retention. The search, get, and export operations of the API give 501 `not_implemented`. The next version adds them.
+The service also gives the search, the get, and the export (CSV and JSON) of the entries to clients with the scope `audit:log:read`.
 
 ## Docs
 
@@ -10,6 +10,7 @@ This version has the intake and the retention. The search, get, and export opera
 - [Configuration](docs/configuration.md)
 - [Intake](docs/intake.md)
 - [Retention](docs/retention.md)
+- [Search, get, and export](docs/search-export.md)
 - [Development](docs/development.md)
 
 ## Quick start

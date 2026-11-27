@@ -36,3 +36,31 @@ type KnownApps interface {
 	// RememberApp keeps an app. A second call with the same app changes nothing.
 	RememberApp(ctx context.Context, app string) error
 }
+
+// ErrNotFound means that the store has no entry for the key.
+var ErrNotFound = errors.New("entries: the entry does not exist")
+
+// Reader reads the entries. The order of all reads is time descending, then
+// the internal key descending.
+type Reader interface {
+	// Search returns a maximum of limit entries that match the filters and are
+	// after the cursor. A nil cursor starts at the newest entry.
+	Search(ctx context.Context, f domain.Filters, after *domain.Cursor, limit int) ([]domain.StoredEntry, error)
+	// Get returns one entry. If service is empty, it returns the entry with the
+	// oldest receipt time. ErrNotFound means that there is no entry.
+	Get(ctx context.Context, id, service string) (domain.StoredEntry, error)
+	// BeginExport starts the read of an export in one read-only snapshot.
+	BeginExport(ctx context.Context, f domain.Filters) (ExportSession, error)
+}
+
+// ExportSession reads the entries of an export from one snapshot. The caller
+// must call Close.
+type ExportSession interface {
+	// Count returns the number of matching entries, but not more than limit.
+	// It must be the first call.
+	Count(ctx context.Context, limit int) (int, error)
+	// Next returns the next entries, a maximum of n. An empty result is the end.
+	Next(ctx context.Context, n int) ([]domain.StoredEntry, error)
+	// Close ends the snapshot.
+	Close(ctx context.Context)
+}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/techorionai/constellation-platform-go/auth/clientcred"
 	"github.com/techorionai/constellation-platform-go/auth/jwt"
+	"github.com/techorionai/constellation-platform-go/clientinfo"
 	"github.com/techorionai/constellation-platform-go/clients/identity"
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
@@ -43,9 +44,46 @@ const (
 	MaxIntakeCount       = 1000
 )
 
+// Limits of the exports.
+const (
+	MinExportMaxEntries  = 1
+	MaxExportMaxEntries  = 1000000
+	MinExportConcurrency = 1
+	MaxExportConcurrency = 16
+	MinExportTimeout     = time.Minute
+	MaxExportTimeout     = time.Hour
+	// defaultMaxConns is the pool size when the config has no value. It is the
+	// default of the database client of platform-go.
+	defaultMaxConns = 10
+)
+
 // HTTP is the config of the public listener.
 type HTTP struct {
 	Addr string `env:"ADDR" envDefault:":8080"`
+	// TrustedProxies is a comma list of CIDR prefixes of the own reverse
+	// proxies. The service reads X-Forwarded-For only from them.
+	TrustedProxies string `env:"TRUSTED_PROXIES"`
+}
+
+// ClientInfo returns the config of the clientinfo middleware. A bad prefix
+// gives an error that names the variable.
+func (h HTTP) ClientInfo() (clientinfo.Config, error) {
+	cfg, err := clientinfo.ParseTrustedProxies(h.TrustedProxies)
+	if err != nil {
+		return clientinfo.Config{}, fmt.Errorf("%sHTTP__TRUSTED_PROXIES: a prefix is not valid", Prefix)
+	}
+	return cfg, nil
+}
+
+// Export is the config of the export of audit entries.
+type Export struct {
+	// MaxEntries is the largest number of entries of one export.
+	MaxEntries int `env:"MAX_ENTRIES" envDefault:"100000"`
+	// Concurrency is the number of exports that one instance runs at the same
+	// time.
+	Concurrency int `env:"CONCURRENCY" envDefault:"2"`
+	// Timeout is the time limit to write the body of one export.
+	Timeout time.Duration `env:"TIMEOUT" envDefault:"10m"`
 }
 
 // Auth is the config of the token verifier. It has the fields of
@@ -101,6 +139,7 @@ type Config struct {
 	Identity  identity.Config   `envPrefix:"IDENTITY__"`
 	Intake    Intake            `envPrefix:"INTAKE__"`
 	Retention Retention         `envPrefix:"RETENTION__"`
+	Export    Export            `envPrefix:"EXPORT__"`
 }
 
 // Load reads the environment and checks the values.
@@ -126,6 +165,29 @@ func (c Config) Validate() error {
 	}
 	if c.Database.MaxConns != 0 && c.Database.MaxConns < MinMaxConns {
 		errs = append(errs, fmt.Errorf("%sDATABASE__MAX_CONNS: must be %d or more", Prefix, MinMaxConns))
+	}
+	if c.Export.MaxEntries < MinExportMaxEntries || c.Export.MaxEntries > MaxExportMaxEntries {
+		errs = append(errs, fmt.Errorf("%sEXPORT__MAX_ENTRIES: must be from %d to %d", Prefix, MinExportMaxEntries, MaxExportMaxEntries))
+	}
+	if c.Export.Concurrency < MinExportConcurrency || c.Export.Concurrency > MaxExportConcurrency {
+		errs = append(errs, fmt.Errorf("%sEXPORT__CONCURRENCY: must be from %d to %d", Prefix, MinExportConcurrency, MaxExportConcurrency))
+	} else {
+		// Each export holds the connection of its read and takes a second
+		// connection for its own entry. The other 4 are for the retention runner
+		// and the intake.
+		maxConns := int(c.Database.MaxConns)
+		if maxConns == 0 {
+			maxConns = defaultMaxConns
+		}
+		if need := MinMaxConns + 2*c.Export.Concurrency; maxConns < need {
+			errs = append(errs, fmt.Errorf("%sDATABASE__MAX_CONNS: must be %d or more with %sEXPORT__CONCURRENCY %d", Prefix, need, Prefix, c.Export.Concurrency))
+		}
+	}
+	if c.Export.Timeout < MinExportTimeout || c.Export.Timeout > MaxExportTimeout {
+		errs = append(errs, fmt.Errorf("%sEXPORT__TIMEOUT: must be from %s to %s", Prefix, MinExportTimeout, MaxExportTimeout))
+	}
+	if _, err := c.HTTP.ClientInfo(); err != nil {
+		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

@@ -21,12 +21,17 @@ import (
 // entries.
 type Entries struct {
 	pool *pgxpool.Pool
+	// reads limits the list and get queries that run at the same time, so that
+	// they cannot take all connections of the pool from the intake.
+	reads chan struct{}
 }
 
 var _ entries.Repository = (*Entries)(nil)
 
 // New makes the repository.
-func New(pool *pgxpool.Pool) *Entries { return &Entries{pool: pool} }
+func New(pool *pgxpool.Pool) *Entries {
+	return &Entries{pool: pool, reads: make(chan struct{}, MaxParallelReads)}
+}
 
 // unavailableCode tells whether a PostgreSQL error code means that the store
 // cannot serve requests now. The classes are 08 (connection exception), 53

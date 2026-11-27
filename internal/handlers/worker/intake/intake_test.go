@@ -312,9 +312,10 @@ func TestConsumerRestartAfterError(t *testing.T) {
 	if got := st.Consumers(); !slices.Equal(got, []string{"a"}) {
 		t.Fatalf("consumers = %v, want the second consumer for a", got)
 	}
-	if !strings.Contains(logs.String(), "an intake consumer stopped") {
-		t.Fatalf("logs = %s", logs.String())
-	}
+	// The consumer leaves the started list before it writes the log record.
+	waitFor(t, "the log record of the stopped consumer", func() bool {
+		return strings.Contains(logs.String(), "an intake consumer stopped")
+	})
 }
 
 // R8: a Lag error removes the old value of the gauge, and a Lag call has a

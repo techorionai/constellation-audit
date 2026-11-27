@@ -12,7 +12,7 @@ The service reads its settings from environment variables with the prefix `AUDIT
 | `AUDIT_ADMIN__CHECK_TIMEOUT` | `2s` | | Time limit of the readiness checks. |
 | `AUDIT_ADMIN__DRAIN_DELAY` | `5s` | | Time that `/readyz` is 503 before the public server stops. |
 | `AUDIT_DATABASE__URL`, `AUDIT_DATABASE__NAME` | required | platform-go `clients/postgres` rules | PostgreSQL. Also `AUDIT_DATABASE__URL_FILE`. |
-| `AUDIT_DATABASE__MAX_CONNS` | `10` | 4 or more | Size of the connection pool. The retention runner needs 2 connections for each tick. The intake and the API need others. |
+| `AUDIT_DATABASE__MAX_CONNS` | `10` | `4 + 2 x AUDIT_EXPORT__CONCURRENCY` or more | Size of the connection pool. The retention runner needs 2 connections for each tick. Each export holds the connection of its read and takes a second connection for its own audit entry. With the default concurrency 2, the smallest value is 8. A smaller value stops the service at start with a message that names this variable. |
 | `AUDIT_VALKEY__ADDRESS`, `AUDIT_VALKEY__KEY_PREFIX` | required | platform-go `clients/valkey` rules | Valkey. Use the key prefix `audit`. |
 | `AUDIT_AUTH__ISSUER` | required | `https`, or `http` with `AUDIT_AUTH__ALLOW_INSECURE_HTTP` | Issuer of the identity service. It is the `iss` claim that the verifier requires. |
 | `AUDIT_AUTH__JWKS_URL` | `<issuer>/.well-known/jwks.json` | | URL of the key set of identity. |
@@ -25,6 +25,10 @@ The service reads its settings from environment variables with the prefix `AUDIT
 | `AUDIT_RETENTION__AUDIT_ENTRIES__PERIOD` | `1440h` (60 days) | | Age after which the retention job deletes an entry. See `retention.md`. |
 | `AUDIT_RETENTION__REJECTED_ENTRIES__PERIOD` | `1440h` (60 days) | | Age after which the retention job deletes a rejected entry. |
 | `AUDIT_RETENTION__<JOB>__INTERVAL`, `AUDIT_RETENTION__<JOB>__BATCH_SIZE` | `1h`, `1000` | `retention.Config` of platform-go | Time between two ticks, and rows for each delete. `<JOB>` is `AUDIT_ENTRIES` or `REJECTED_ENTRIES`. |
+| `AUDIT_HTTP__TRUSTED_PROXIES` | empty | Comma list of CIDR prefixes, for example `10.0.0.0/8,192.168.0.0/16` | Addresses of your own reverse proxies. The service reads `X-Forwarded-For` only from a connection from these addresses. The audit entry of an export records the client IP address that results. Set only the addresses of proxies that you control. A wrong value records a wrong IP address. |
+| `AUDIT_EXPORT__MAX_ENTRIES` | `100000` | 1 to 1000000 | Largest number of entries of one export. More entries give 422 `export_too_large`. |
+| `AUDIT_EXPORT__CONCURRENCY` | `2` | 1 to 16 | Number of exports that one instance runs at the same time. More give 429 `too_many_exports`. The default is the value of the contract. An operator with a large database can set a higher value. |
+| `AUDIT_EXPORT__TIMEOUT` | `10m` | `1m` to `1h` | Time limit to write the body of one export. |
 
 The audience of the service is the constant `audit`. The service does not read `AUDIT_AUTH__AUDIENCE`. A value in that variable has no effect.
 

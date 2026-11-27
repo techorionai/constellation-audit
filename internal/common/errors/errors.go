@@ -76,3 +76,21 @@ func AsProblem(err error) (*ProblemError, bool) {
 func NewNotFound(code, detail string) *ProblemError {
 	return NewProblem(http.StatusNotFound, code, detail)
 }
+
+// NewBadRequest makes a 400 ProblemError with the code.
+func NewBadRequest(code, detail string) *ProblemError {
+	return NewProblem(http.StatusBadRequest, code, detail)
+}
+
+// NewUnprocessable makes a 422 ProblemError with the code.
+func NewUnprocessable(code, detail string) *ProblemError {
+	return NewProblem(http.StatusUnprocessableEntity, code, detail)
+}
+
+// NewTooManyRequests makes a 429 ProblemError with the code and the wait time
+// of the header Retry-After.
+func NewTooManyRequests(code, detail string, retryAfter time.Duration) *ProblemError {
+	p := NewProblem(http.StatusTooManyRequests, code, detail)
+	p.RetryAfter = retryAfter
+	return p
+}

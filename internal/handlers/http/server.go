@@ -5,6 +5,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -15,13 +16,13 @@ import (
 	"github.com/techorionai/constellation-platform-go/requestid"
 	"go.opentelemetry.io/otel/trace"
 
+	"github.com/techorionai/constellation-audit/internal/app/commands"
+	"github.com/techorionai/constellation-audit/internal/app/problems"
+	"github.com/techorionai/constellation-audit/internal/app/queries"
 	apperrors "github.com/techorionai/constellation-audit/internal/common/errors"
+	"github.com/techorionai/constellation-audit/internal/domain"
 	"github.com/techorionai/constellation-audit/internal/handlers/http/gen"
 )
-
-// CodeNotImplemented is the code of the Problem of an operation that the service
-// does not implement yet.
-const CodeNotImplemented = "not_implemented"
 
 // Server implements the generated strict server interface.
 type Server struct {
@@ -32,8 +33,28 @@ type Server struct {
 
 var _ gen.StrictServerInterface = (*Server)(nil)
 
-// Deps are the token check of /v1 and the logger.
+// Lister is the use case that searches the entries.
+type Lister interface {
+	Execute(ctx context.Context, q queries.ListEntries) (queries.ListEntriesResult, error)
+}
+
+// Getter is the use case that reads one entry.
+type Getter interface {
+	Execute(ctx context.Context, q queries.GetEntry) (domain.StoredEntry, error)
+}
+
+// Exporter is the use case that starts an export.
+type Exporter interface {
+	Execute(ctx context.Context, cmd commands.ExportEntries) (*commands.ExportStream, error)
+}
+
+// Deps are the token check of /v1, the use cases, and the logger.
 type Deps struct {
+	List   Lister
+	Get    Getter
+	Export Exporter
+	// ExportTimeout is the time limit to write the body of one export.
+	ExportTimeout time.Duration
 	// Verifier checks the bearer token of each /v1 request. Scopes gives the
 	// scopes of each /v1 operation. Without them, each /v1 request fails with
 	// a 500 Problem, because the service fails closed.
@@ -79,6 +100,8 @@ func (s *Server) protect(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// All answers of the operations, also 401 and 403, have the cache headers.
+		noStore(w)
 		scopes, ok := s.d.Scopes[r.Pattern]
 		if !ok || s.authMW == nil {
 			s.log.ErrorContext(r.Context(), "a /v1 route has no scope table entry or the service has no verifier", "pattern", r.Pattern)
@@ -89,27 +112,41 @@ func (s *Server) protect(next http.Handler) http.Handler {
 	})
 }
 
-// AuditEntriesList is not implemented in this version.
-func (s *Server) AuditEntriesList(context.Context, gen.AuditEntriesListRequestObject) (gen.AuditEntriesListResponseObject, error) {
-	return nil, notImplemented()
+// noStore sets the cache headers of the operations.
+func noStore(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", cacheControl)
+	w.Header().Set("Pragma", pragma)
 }
 
-// AuditEntriesExport is not implemented in this version.
-func (s *Server) AuditEntriesExport(context.Context, gen.AuditEntriesExportRequestObject) (gen.AuditEntriesExportResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// AuditEntriesGet is not implemented in this version.
-func (s *Server) AuditEntriesGet(context.Context, gen.AuditEntriesGetRequestObject) (gen.AuditEntriesGetResponseObject, error) {
-	return nil, notImplemented()
-}
-
-func notImplemented() error {
-	return apperrors.NewProblem(http.StatusNotImplemented, CodeNotImplemented, "The operation is not implemented.")
-}
-
-func (s *Server) requestError(w http.ResponseWriter, r *http.Request, _ error) {
-	s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "The request is not valid.")
+// requestError maps the error of a parameter that the generated code cannot
+// decode. A value of the id path parameter that is not a UUID gives 404
+// audit_entry_not_found, because the contract says so. Each other parameter
+// error gives 400 invalid_parameter. Other request errors give 400
+// invalid_request.
+func (s *Server) requestError(w http.ResponseWriter, r *http.Request, err error) {
+	noStore(w)
+	var (
+		format   *gen.InvalidParamFormatError
+		required *gen.RequiredParamError
+		many     *gen.TooManyValuesForParamError
+		param    string
+	)
+	switch {
+	case errors.As(err, &format):
+		if format.ParamName == "id" {
+			s.writeProblem(w, r, http.StatusNotFound, queries.CodeEntryNotFound, http.StatusText(http.StatusNotFound), "The audit entry does not exist.")
+			return
+		}
+		param = format.ParamName
+	case errors.As(err, &required):
+		param = required.ParamName
+	case errors.As(err, &many):
+		param = many.ParamName
+	default:
+		s.writeProblem(w, r, http.StatusBadRequest, "invalid_request", "Invalid request", "The request is not valid.")
+		return
+	}
+	s.writeProblem(w, r, http.StatusBadRequest, problems.CodeInvalidParameter, http.StatusText(http.StatusBadRequest), "The parameter "+param+" is not valid.")
 }
 
 func (s *Server) responseError(w http.ResponseWriter, r *http.Request, err error) {
