@@ -61,7 +61,9 @@ func WithRetentionAfter(after func(time.Duration) <-chan time.Time) Option {
 }
 
 // WithReaderSelectors makes the Valkey reader user of the service with these
-// selectors in place of streamsvalkey.AuditReaderSelectors().
+// selectors in place of streamsvalkey.AuditReaderSelectors(). The option has no
+// effect with WithPlainValkey. With no argument, the service gets the default
+// selectors.
 func WithReaderSelectors(selectors ...string) Option {
 	return func(s *settings) { s.readerSel = selectors }
 }

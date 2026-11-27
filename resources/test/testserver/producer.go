@@ -146,14 +146,18 @@ func (e *Env) NewProxiedDB(t testing.TB) (DB, *TCPProxy) {
 	return DB{URL: platformconfig.Secret(u.String()), Name: db.Name}, proxy
 }
 
+// OldIndexKey is the index of the producers in v0.8.0. The service does not read
+// it in v0.9.0. The tests use it to forge names and to clean up.
+const OldIndexKey = "audit.streams"
+
 // ResetAuditStreams deletes the audit streams, the trusted set audit.apps, and
-// the old index audit.streams of all producers. A test calls it at its start, so that the tests of the package do
-// not read the entries of each other.
+// the old index audit.streams of all producers. A test calls it at its start, so
+// that the tests of the package do not read the entries of each other.
 func (e *Env) ResetAuditStreams(t testing.TB) {
 	t.Helper()
 	admin := e.ValkeyAdmin(t)
 	ctx := context.Background()
-	keys := []string{streams.AuditAppsKey, "audit.streams"}
+	keys := []string{streams.AuditAppsKey, OldIndexKey}
 	var cursor uint64
 	for {
 		entry, err := admin.Do(ctx, admin.B().Scan().Cursor(cursor).Match(streams.AuditKeyPrefix+"*").Count(1000).Build()).AsScanEntry()

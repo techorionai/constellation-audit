@@ -454,7 +454,7 @@ func forgeApps(t *testing.T, n int) {
 	t.Helper()
 	admin := env.ValkeyAdmin(t)
 	for start := 0; start < n; start += 1000 {
-		cmd := []string{"SADD", "audit.streams"}
+		cmd := []string{"SADD", testserver.OldIndexKey}
 		for i := start; i < min(start+1000, n); i++ {
 			cmd = append(cmd, "f"+strconv.Itoa(100000+i))
 		}
@@ -468,7 +468,7 @@ func forgeApps(t *testing.T, n int) {
 func indexSize(t *testing.T) int64 {
 	t.Helper()
 	admin := env.ValkeyAdmin(t)
-	n, err := admin.Do(context.Background(), admin.B().Scard().Key("audit.streams").Build()).AsInt64()
+	n, err := admin.Do(context.Background(), admin.B().Scard().Key(testserver.OldIndexKey).Build()).AsInt64()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,6 +613,11 @@ func TestI23_ReaderWithTransitionSelectors(t *testing.T) {
 	newapp := env.NewProducer(t, "newapp")
 	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
 	waitCount(t, pool(t, srv.DB), 1, selectRows)
+	// A second producer proves that a later refresh also reads the set. The
+	// counter is cumulative, so it shows each failed refresh before this point.
+	other := env.NewProducer(t, "other")
+	other.Write(t, audit.Entry{Action: "other:thing:write", Result: audit.Success})
+	waitCount(t, pool(t, srv.DB), 2, selectRows)
 	if got := counter(t, reader, problems, "reason", "apps_error"); got != 0 {
 		t.Fatalf("apps_error = %d, want 0", got)
 	}
