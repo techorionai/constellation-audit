@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -473,6 +474,30 @@ func indexSize(t *testing.T) int64 {
 	return n
 }
 
+// indexMembers returns the members of audit.streams as seen by the admin user.
+func indexMembers(t *testing.T) []string {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	m, err := admin.Do(context.Background(), admin.B().Smembers().Key("audit.streams").Build()).AsStrSlice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(m)
+	return m
+}
+
+// waitIndexSize waits until audit.streams has want members.
+func waitIndexSize(t *testing.T, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for indexSize(t) != want && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := indexSize(t); got != want {
+		t.Fatalf("audit.streams has %d members after 30 seconds, want %d", got, want)
+	}
+}
+
 // I20: a producer fills audit.streams with 12000 forged names. A new producer
 // that is not in known_apps is still found, and AuditApps deletes the forged
 // names. No too_many_apps problem is counted.
@@ -488,12 +513,9 @@ func TestI20_ForgedIndexDoesNotHideNewProducer(t *testing.T) {
 	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
 	waitCount(t, db, 2, selectRows)
 	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
-	deadline := time.Now().Add(30 * time.Second)
-	for indexSize(t) > 2 && time.Now().Before(deadline) {
-		time.Sleep(100 * time.Millisecond)
-	}
-	if got := indexSize(t); got > 2 {
-		t.Fatalf("audit.streams has %d members, want only the real apps", got)
+	waitIndexSize(t, 2)
+	if got := indexMembers(t); !slices.Equal(got, []string{"helpdesk", "newapp"}) {
+		t.Fatalf("audit.streams members = %v, want [helpdesk newapp]", got)
 	}
 	if got := counter(t, reader, "constellation.audit.intake.problems", "reason", "too_many_apps"); got != 0 {
 		t.Fatalf("too_many_apps = %d, want 0", got)
@@ -501,26 +523,30 @@ func TestI20_ForgedIndexDoesNotHideNewProducer(t *testing.T) {
 }
 
 // I21: the reader user has the v0.7.0 selectors, with no +srem. The service
-// works: a new producer is found and the forged names stay in the set. No
+// works: new producers are found and the forged names stay in the set. No
 // apps_error and no too_many_apps problem is counted.
 func TestI21_ReaderWithoutSrem(t *testing.T) {
 	const v070 = "(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange) (~audit.streams +sscan)"
+	const forged = 5000
 	mp, reader := meterOf(t)
 	srv := started(t, testserver.WithMeterProvider(mp), testserver.WithReaderSelectors(v070))
 	db := pool(t, srv.DB)
 	helpdesk := env.NewProducer(t, "helpdesk")
 	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
 	waitCount(t, db, 1, selectRows)
-	forgeApps(t, 5000)
-	before := indexSize(t)
+	forgeApps(t, forged)
 	newapp := env.NewProducer(t, "newapp")
 	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
 	waitCount(t, db, 2, selectRows)
 	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
-	// Wait for at least one more refresh, to see that nothing is deleted.
-	time.Sleep(1500 * time.Millisecond)
-	if got := indexSize(t); got < before {
-		t.Fatalf("audit.streams has %d members, want at least %d (no delete)", got, before)
+	// A third producer is found only by a refresh that starts after the
+	// refresh that found newapp. That refresh would have deleted forged names.
+	third := env.NewProducer(t, "thirdapp")
+	third.Write(t, audit.Entry{Action: "thirdapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 3, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'thirdapp'`)
+	if got, want := indexSize(t), int64(forged+3); got != want {
+		t.Fatalf("audit.streams has %d members, want %d (no delete)", got, want)
 	}
 	for _, reason := range []string{"apps_error", "too_many_apps"} {
 		if got := counter(t, reader, "constellation.audit.intake.problems", "reason", reason); got != 0 {
