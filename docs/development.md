@@ -48,8 +48,8 @@ The audit service runs in the test process, except in the image test. Its Valkey
 
 ### Producers
 
-A test producer (`env.NewProducer(t, app)`) has its own Valkey ACL user with the selectors of the event streams and of an audit producer (`ACLSelectors` and `AuditProducerSelectors`). It writes entries with the audit writer of platform-go and adds them to the audit stream with the audit publisher of platform-go. It does not use the database relay of the outbox. `PublishRaw` adds a payload to the stream with no check, for entries that the writer refuses.
+A test producer (`env.NewProducer(t, app)`) registers the app in `audit.apps` as admin, as the provisioner does in production. `env.NewUnregisteredProducer(t, app)` makes the same producer with no registration. The producer has its own Valkey ACL user with the selectors of the event streams and of an audit producer (`ACLSelectors` and `AuditProducerSelectors`). It writes entries with the audit writer of platform-go and adds them to the audit stream with the audit publisher of platform-go. It does not use the database relay of the outbox. `PublishRaw` adds a payload to the stream with no check, for entries that the writer refuses.
 
-Each service test calls `env.ResetAuditStreams`, so the tests do not read the entries of each other.
+`env.ResetAuditStreams` deletes `audit.apps`, `audit.streams`, and the audit streams. Each service test calls it before it makes its producers, so the tests do not read the entries of each other.
 
 `env.NewProxiedDB` gives a database behind a TCP proxy. A test stops and starts the proxy to stop and start the database.

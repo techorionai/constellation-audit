@@ -39,7 +39,11 @@ The service stops at start with a message that names the variable when a rule fa
 The Valkey user of the audit service needs the key pattern `~audit:*` and the command rule of platform-go. It also needs the two selectors of `streamsvalkey.AuditReaderSelectors()`:
 
 - the audit streams `audit.stream:*`: `+xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange`,
-- the set `audit.streams`: `+sscan`.
+- the set `audit.apps`: `(~audit.apps +sscan)`.
+
+The reader has no write command on the set. The provisioner registers each producer in `audit.apps` as admin. Without `+sscan` on `audit.apps`, each refresh counts `apps_error`, `known_apps` keeps the known apps, and a new producer is not found. To check the ACL, run `ACL DRYRUN <reader user> SSCAN audit.apps 0`. It must return `OK`. Run `ACL DRYRUN <reader user> SREM audit.apps x`. It must give an error.
+
+Upgrade from `v0.1.x`: follow the order of the section "Upgrade from v0.8.0 to v0.9.0" of constellation-platform-go. Before the `v0.2.0` image starts, register the producers and give the reader the transition selectors (the selectors of `v0.9.0` and `(~audit.streams +sscan)`). After the update, the reader needs only the selectors of `v0.9.0`. The update of `constellation-deploy` does these steps.
 
 Give these selectors only to the audit service user. A producer user gets the selectors of `streamsvalkey.AuditProducerSelectors(app)`. They give no read access.
 

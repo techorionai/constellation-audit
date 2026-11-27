@@ -32,6 +32,7 @@ type settings struct {
 	claimIdle   time.Duration
 	retention   func(time.Duration) <-chan time.Time
 	plainValkey bool
+	readerSel   []string
 }
 
 // Option changes a test server.
@@ -57,6 +58,14 @@ func WithClaimIdle(d time.Duration) Option { return func(s *settings) { s.claimI
 // WithRetentionAfter sets the timer function of the retention runner.
 func WithRetentionAfter(after func(time.Duration) <-chan time.Time) Option {
 	return func(s *settings) { s.retention = after }
+}
+
+// WithReaderSelectors makes the Valkey reader user of the service with these
+// selectors in place of streamsvalkey.AuditReaderSelectors(). The option has no
+// effect with WithPlainValkey. With no argument, the service gets the default
+// selectors.
+func WithReaderSelectors(selectors ...string) Option {
+	return func(s *settings) { s.readerSel = selectors }
 }
 
 // WithPlainValkey makes the service connect with the default user of Valkey,
@@ -126,7 +135,11 @@ func (e *Env) StartE(t testing.TB, opts ...Option) (*Server, error) {
 	valkeyUser := ""
 	if !s.plainValkey {
 		var pw string
-		valkeyUser, pw = e.NewValkeyACLUser(t)
+		if s.readerSel != nil {
+			valkeyUser, pw = e.aclUser(t, "audit", s.readerSel...)
+		} else {
+			valkeyUser, pw = e.NewValkeyACLUser(t)
+		}
 		cfg.Valkey.Username, cfg.Valkey.Password = valkeyUser, platformconfig.Secret(pw)
 	}
 	cfg.Admin.Addr = "127.0.0.1:0"

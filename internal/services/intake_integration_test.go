@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/techorionai/constellation-platform-go/audit"
+	"github.com/techorionai/constellation-platform-go/resources/test/containers"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"github.com/techorionai/constellation-audit/internal/config"
 	"github.com/techorionai/constellation-audit/internal/domain"
@@ -416,11 +419,12 @@ func TestI18_FutureTime(t *testing.T) {
 	waitNoPending(t, p)
 }
 
-// I19 (R11): a producer fills the index audit.streams with forged names, so
-// that the list of the apps has no real app. After the restart of the service,
-// the entries of the real app are stored, because the service keeps the known
-// apps in PostgreSQL.
-func TestI19_ForgedIndexAfterRestart(t *testing.T) {
+// I19 (R11, decision D10): the service keeps the intake of a known app that is
+// not in audit.apps. The service stores the first entry. After the stop,
+// helpdesk writes a second entry, the admin removes helpdesk from audit.apps,
+// and a new service on the same database stores the second entry, because
+// known_apps in PostgreSQL has helpdesk.
+func TestI19_UnregisteredKnownAppAfterRestart(t *testing.T) {
 	db, _ := env.NewProxiedDB(t)
 	srv := started(t, testserver.WithDB(db))
 	p := env.NewProducer(t, "helpdesk")
@@ -431,18 +435,190 @@ func TestI19_ForgedIndexAfterRestart(t *testing.T) {
 
 	p.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
 	admin := env.ValkeyAdmin(t)
-	forged := []string{"SADD", "audit.streams"}
-	for i := range 10100 {
-		forged = append(forged, "f"+strconv.Itoa(100000+i))
-	}
-	for _, cmd := range [][]string{{"DEL", "audit.streams"}, forged} {
-		if err := admin.Do(context.Background(), admin.B().Arbitrary(cmd...).Build()).Error(); err != nil {
-			t.Fatal(err)
-		}
+	if err := admin.Do(context.Background(), admin.B().Srem().Key("audit.apps").Member("helpdesk").Build()).Error(); err != nil {
+		t.Fatal(err)
 	}
 
 	srv2 := env.Start(t, testserver.WithDB(db))
 	srv2.WaitReady(t)
 	waitCount(t, pool(t, srv2.DB), 2, selectRows)
 	waitNoPending(t, p)
+	if got := appsMembers(t); len(got) != 0 {
+		t.Fatalf("audit.apps = %v, want empty", got)
+	}
+}
+
+// forgeApps adds forged app names that pass the pattern to the old index
+// audit.streams. In v0.9.0 the service does not read this key.
+func forgeApps(t *testing.T, n int) {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	for start := 0; start < n; start += 1000 {
+		cmd := []string{"SADD", testserver.OldIndexKey}
+		for i := start; i < min(start+1000, n); i++ {
+			cmd = append(cmd, "f"+strconv.Itoa(100000+i))
+		}
+		if err := admin.Do(context.Background(), admin.B().Arbitrary(cmd...).Build()).Error(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// indexSize returns the size of audit.streams as seen by the admin user.
+func indexSize(t *testing.T) int64 {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	n, err := admin.Do(context.Background(), admin.B().Scard().Key(testserver.OldIndexKey).Build()).AsInt64()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// appsMembers returns the members of audit.apps as seen by the admin user.
+func appsMembers(t *testing.T) []string {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	m, err := admin.Do(context.Background(), admin.B().Smembers().Key("audit.apps").Build()).AsStrSlice()
+	if err != nil {
+		t.Fatal(err)
+	}
+	slices.Sort(m)
+	return m
+}
+
+// xinfoStreamCalls reads the number of XINFO STREAM calls that Valkey has seen,
+// as admin, from INFO commandstats.
+func xinfoStreamCalls(t *testing.T) int64 {
+	t.Helper()
+	admin := env.ValkeyAdmin(t)
+	info, err := admin.Do(context.Background(), admin.B().Info().Section("commandstats").Build()).ToString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(info, "\n") {
+		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "cmdstat_xinfo|stream:calls=")
+		if !ok {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.SplitN(rest, ",", 2)[0], 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	return 0
+}
+
+// waitCounterAtLeast waits until the counter has at least want for the value.
+func waitCounterAtLeast(t *testing.T, reader *sdkmetric.ManualReader, name, key, value string, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for counter(t, reader, name, key, value) < want && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := counter(t, reader, name, key, value); got < want {
+		t.Fatalf("%s %s=%s is %d after 30 seconds, want at least %d", name, key, value, got, want)
+	}
+}
+
+const problems = "constellation.audit.intake.problems"
+
+// I20 (R5): a producer fills the old index audit.streams with 100000 forged
+// names. A new registered producer is found, the forged names give no
+// XINFO STREAM load, and the service deletes nothing.
+func TestI20_ForgedOldIndexGivesNoLoad(t *testing.T) {
+	mp, reader := meterOf(t)
+	srv := started(t, testserver.WithMeterProvider(mp))
+	db := pool(t, srv.DB)
+	helpdesk := env.NewProducer(t, "helpdesk")
+	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	waitCount(t, db, 1, selectRows)
+	forgeApps(t, 100000)
+	before := xinfoStreamCalls(t)
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 2, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
+	third := env.NewProducer(t, "thirdapp")
+	third.Write(t, audit.Entry{Action: "thirdapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 3, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'thirdapp'`)
+	if inc := xinfoStreamCalls(t) - before; inc >= 1000 {
+		t.Fatalf("XINFO STREAM calls increased by %d, want less than 1000", inc)
+	}
+	if got := indexSize(t); got != 100000 {
+		t.Fatalf("audit.streams has %d members, want 100000 (no delete)", got)
+	}
+	for _, reason := range []string{"apps_error", "too_many_apps"} {
+		if got := counter(t, reader, problems, "reason", reason); got != 0 {
+			t.Fatalf("%s = %d, want 0", reason, got)
+		}
+	}
+}
+
+// I21: a producer that is not registered is not found. After the admin
+// registers it, the service stores its entry from the start of the stream.
+func TestI21_UnregisteredProducerNotFound(t *testing.T) {
+	srv := started(t)
+	db := pool(t, srv.DB)
+	ghost := env.NewUnregisteredProducer(t, "ghost")
+	ghost.Write(t, audit.Entry{Action: "ghost:thing:write", Result: audit.Success})
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 1, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'newapp'`)
+	waitCount(t, db, 0, `SELECT count(*) FROM audit_entries WHERE service = 'ghost'`)
+	waitCount(t, db, 0, `SELECT count(*) FROM known_apps WHERE app = 'ghost'`)
+
+	containers.RegisterAuditApps(t, env.ValkeyAdmin(t), "ghost")
+	waitCount(t, db, 2, selectRows)
+	waitCount(t, db, 1, `SELECT count(*) FROM known_apps WHERE app = 'ghost'`)
+}
+
+// I22: the reader user has the v0.8.0 selectors, with no +sscan on audit.apps.
+// Each refresh counts apps_error, known_apps keeps the intake of helpdesk, and
+// the service does not find the new producer newapp.
+func TestI22_ReaderWithOldSelectors(t *testing.T) {
+	const v080 = "(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange) (~audit.streams +sscan +srem)"
+	srv := started(t)
+	helpdesk := env.NewProducer(t, "helpdesk")
+	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	waitCount(t, pool(t, srv.DB), 1, selectRows)
+	waitCount(t, pool(t, srv.DB), 1, `SELECT count(*) FROM known_apps WHERE app = 'helpdesk'`)
+	srv.Stop()
+
+	mp, reader := meterOf(t)
+	srv2 := env.Start(t, testserver.WithDB(srv.DB), testserver.WithMeterProvider(mp), testserver.WithReaderSelectors(v080))
+	srv2.WaitReady(t)
+	db := pool(t, srv2.DB)
+	helpdesk.Write(t, audit.Entry{Action: "helpdesk:ticket:write", Result: audit.Success})
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, db, 2, selectRows)
+	waitCounterAtLeast(t, reader, problems, "reason", "apps_error", 2)
+	waitCount(t, db, 0, `SELECT count(*) FROM audit_entries WHERE service = 'newapp'`)
+	if got := appsMembers(t); !slices.Equal(got, []string{"helpdesk", "newapp"}) {
+		t.Fatalf("audit.apps = %v, want [helpdesk newapp]", got)
+	}
+}
+
+// I23: the reader user has the transition selectors: the selectors of v0.9.0
+// and +sscan on audit.streams. The service finds a registered producer and
+// counts no apps_error.
+func TestI23_ReaderWithTransitionSelectors(t *testing.T) {
+	const transition = "(~audit.stream:* +xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange) (~audit.apps +sscan) (~audit.streams +sscan)"
+	mp, reader := meterOf(t)
+	srv := started(t, testserver.WithMeterProvider(mp), testserver.WithReaderSelectors(transition))
+	newapp := env.NewProducer(t, "newapp")
+	newapp.Write(t, audit.Entry{Action: "newapp:thing:write", Result: audit.Success})
+	waitCount(t, pool(t, srv.DB), 1, selectRows)
+	// A second producer proves that a later refresh also reads the set. The
+	// counter is cumulative, so it shows each failed refresh before this point.
+	other := env.NewProducer(t, "other")
+	other.Write(t, audit.Entry{Action: "other:thing:write", Result: audit.Success})
+	waitCount(t, pool(t, srv.DB), 2, selectRows)
+	if got := counter(t, reader, problems, "reason", "apps_error"); got != 0 {
+		t.Fatalf("apps_error = %d, want 0", got)
+	}
 }

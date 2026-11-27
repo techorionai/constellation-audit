@@ -4,13 +4,16 @@ The intake reads the audit stream `audit.stream:<app>` of each producer with the
 
 ## Find the producers
 
-The supervisor reads the set `audit.streams` with `streamsvalkey.AuditApps` at the start and at each `AUDIT_INTAKE__REFRESH`. The install refuses `SCAN`, and not all producers have event types in the catalog, so the set is the list of producers. A producer adds its app to the set with its first audit publish.
+The supervisor reads the set `audit.apps` with `streamsvalkey.AuditApps` at the start and at each `AUDIT_INTAKE__REFRESH`. Only the provisioner (the Valkey admin) writes the set. It registers each producer when it makes the ACL user of the producer (`SADD audit.apps <app>`). A producer cannot write the set, so a forged name is not possible. `AuditApps` counts a member only when its stream exists. It deletes no member. A registered app with no stream is examined again at each refresh. A producer that is not registered is not found.
+
+`AuditApps` reads a maximum of 10000 members of the set.
 
 - The supervisor starts one consumer for each new app. The group is `audit` and the start ID is `0`, so the intake also reads the entries that a producer wrote before the audit service saw its app.
-- The supervisor keeps each app that has a consumer in the table `known_apps` of PostgreSQL. At each refresh, it reads the table and starts the consumers of the known apps before it reads the set. A producer can add forged names to the set `audit.streams`, because its ACL allows `SADD` with any value. `AuditApps` can then stop at its limit before it finds the real apps. The table makes sure that the real apps keep their consumers, also after a restart. If the supervisor cannot read the table, it counts the event (reason `known_apps_error`) and goes on with the set.
+- The supervisor keeps each app that has a consumer in the table `known_apps` of PostgreSQL. At each refresh, it reads the table and starts the consumers of the known apps before it reads the set. The table keeps the consumers of the known apps in three cases: `audit.apps` is empty, an app is not in the set, or the reader cannot read the set (`apps_error`). If the supervisor cannot read the table, it counts the event (reason `known_apps_error`) and goes on with the set.
 - The supervisor never stops a consumer when an app leaves the set.
+- An app that the operator removes from `audit.apps` stays in `known_apps`, and the intake of the app starts again after each restart. To stop the intake of an app for good, remove the app from `audit.apps` (`SREM audit.apps <app>`), delete its row (`DELETE FROM known_apps WHERE app = '<app>'`), and restart the service. A consumer that runs does not stop until the restart.
 - If a consumer stops with an error while the service runs, the supervisor counts the event (reason `consumer_stopped`), logs it, and starts a new consumer for that app at the next refresh.
-- The limit is 1000 apps. If the set has more valid apps, `AuditApps` returns the first 1000 and `ErrTooManyAuditApps`. The supervisor logs one warn record that names the limit, counts the event (`constellation.audit.intake.problems`, reason `too_many_apps`), and uses the list. The supervisor also keeps its own limit of 1000 consumers. The producers above the limit are not read.
+- The limit is 1000 apps. `AuditApps` returns the first 1000 and `ErrTooManyAuditApps` when more than 1000 registered apps have a stream, or when the set has more than 10000 members. Both cases are an operator error, not an attack. The supervisor logs one warn record that names the limit, counts the event (`constellation.audit.intake.problems`, reason `too_many_apps`), and uses the list. The supervisor also keeps its own limit of 1000 consumers. The producers above the limit are not read.
 - On another error, the supervisor logs and counts the error, keeps the current consumers, and tries again at the next refresh.
 
 ## Checks

@@ -362,9 +362,10 @@ func TestLagErrorClearsGauge(t *testing.T) {
 	}
 }
 
-// R11: the supervisor starts the consumers of the known apps before and with no
-// regard to the index of the producers. With a list from Apps that has forged
-// apps only, the real apps keep their consumers. A new app is remembered once.
+// R11: the supervisor starts the consumers of the known apps before it reads the
+// list from Apps. With a list from Apps that has other apps only (and an
+// ErrTooManyApps error), the known apps keep their consumers. The apps of the
+// list are remembered at each refresh.
 func TestKnownAppsStartFirst(t *testing.T) {
 	order := []string{}
 	var mu sync.Mutex

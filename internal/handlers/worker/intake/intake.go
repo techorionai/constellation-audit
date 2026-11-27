@@ -147,9 +147,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 
 // Refresh starts a consumer for each known app, reads the producers, starts a
 // consumer for each new producer and keeps it as a known app, and reads the lag
-// of each stream. The known apps come from the store, so a producer that fills
-// the index of the producers with forged names cannot push out the real apps
-// (R11). The consumers run until ctx ends.
+// of each stream. The known apps come from the store, so the intake of a known
+// app goes on when audit.apps is empty, does not list the app, or cannot be
+// read (R11). The consumers run until ctx ends.
 func (s *Supervisor) Refresh(ctx context.Context) {
 	known, err := s.cfg.Known.KnownApps(ctx, MaxConsumers)
 	if err != nil {
