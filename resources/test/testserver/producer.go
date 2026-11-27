@@ -65,9 +65,20 @@ type Producer struct {
 	writer audit.Writer
 }
 
-// NewProducer makes a producer for an app. The ACL user and the client end at
-// the cleanup of the test.
+// NewProducer makes a producer for an app and registers the app in the trusted
+// set audit.apps as admin, as the provisioner does in production. The ACL user
+// and the client end at the cleanup of the test.
 func (e *Env) NewProducer(t testing.TB, app string) *Producer {
+	t.Helper()
+	p := e.NewUnregisteredProducer(t, app)
+	containers.RegisterAuditApps(t, e.ValkeyAdmin(t), app)
+	return p
+}
+
+// NewUnregisteredProducer makes the same producer as NewProducer but does not
+// register the app in audit.apps. The service does not find it until a test
+// registers the app.
+func (e *Env) NewUnregisteredProducer(t testing.TB, app string) *Producer {
 	t.Helper()
 	user, pw := e.aclUser(t, app, streamsvalkey.ACLSelectors(app), streamsvalkey.AuditProducerSelectors(app))
 	c, err := valkeygo.NewClient(valkeygo.ClientOption{
@@ -135,14 +146,14 @@ func (e *Env) NewProxiedDB(t testing.TB) (DB, *TCPProxy) {
 	return DB{URL: platformconfig.Secret(u.String()), Name: db.Name}, proxy
 }
 
-// ResetAuditStreams deletes the audit streams and the audit index of all
-// producers. A test calls it at its start, so that the tests of the package do
+// ResetAuditStreams deletes the audit streams, the trusted set audit.apps, and
+// the old index audit.streams of all producers. A test calls it at its start, so that the tests of the package do
 // not read the entries of each other.
 func (e *Env) ResetAuditStreams(t testing.TB) {
 	t.Helper()
 	admin := e.ValkeyAdmin(t)
 	ctx := context.Background()
-	keys := []string{streams.AuditIndexKey}
+	keys := []string{streams.AuditAppsKey, "audit.streams"}
 	var cursor uint64
 	for {
 		entry, err := admin.Do(ctx, admin.B().Scan().Cursor(cursor).Match(streams.AuditKeyPrefix+"*").Count(1000).Build()).AsScanEntry()
