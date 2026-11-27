@@ -15,6 +15,7 @@ import (
 
 	"github.com/techorionai/constellation-platform-go/auth/clientcred"
 	"github.com/techorionai/constellation-platform-go/auth/jwt"
+	"github.com/techorionai/constellation-platform-go/clientinfo"
 	"github.com/techorionai/constellation-platform-go/clients/identity"
 	clientpg "github.com/techorionai/constellation-platform-go/clients/postgres"
 	clientvk "github.com/techorionai/constellation-platform-go/clients/valkey"
@@ -36,6 +37,7 @@ import (
 	"github.com/techorionai/constellation-audit/internal/adapters/postgres"
 	vkadapter "github.com/techorionai/constellation-audit/internal/adapters/valkey"
 	"github.com/techorionai/constellation-audit/internal/app/commands"
+	"github.com/techorionai/constellation-audit/internal/app/queries"
 	"github.com/techorionai/constellation-audit/internal/config"
 	httpapi "github.com/techorionai/constellation-audit/internal/handlers/http"
 	"github.com/techorionai/constellation-audit/internal/handlers/worker/intake"
@@ -227,8 +229,29 @@ func Start(ctx context.Context, cfg config.Config, opts ...Option) (_ *App, err 
 		return nil, fmt.Errorf("make the token verifier: %w", err)
 	}
 	a.verify.Start(context.WithoutCancel(ctx))
-	api := httpapi.New(httpapi.Deps{Verifier: a.verify, Scopes: scopes, Log: log})
-	handler := otelhttp.NewHandler(requestid.Middleware()(api.Handler()), "audit")
+	clientCfg, err := cfg.HTTP.ClientInfo()
+	if err != nil {
+		return nil, err
+	}
+	mp := o.meter
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
+	observe := []decorators.Option{decorators.WithLogger(log), decorators.WithMeterProvider(mp)}
+	list := decorators.ApplyTracing(decorators.ApplyLogging(queries.NewListEntries(repo), "ListEntries", observe...), "ListEntries", observe...)
+	get := decorators.ApplyTracing(decorators.ApplyLogging(queries.NewGetEntry(repo), "GetEntry", observe...), "GetEntry", observe...)
+	export, err := commands.NewExportEntries(repo, repo, mp.Meter("audit"), cfg.Export.MaxEntries, cfg.Export.Concurrency, log)
+	if err != nil {
+		return nil, fmt.Errorf("make the export command: %w", err)
+	}
+	api := httpapi.New(httpapi.Deps{
+		Verifier: a.verify, Scopes: scopes, Log: log,
+		List: list, Get: get, Export: export, ExportTimeout: cfg.Export.Timeout,
+	})
+	// The chain is otelhttp, requestid, clientinfo, then the auth middleware and
+	// the router. The own audit entry of an export needs the request ID, the IP
+	// address, and the user agent from the context.
+	handler := otelhttp.NewHandler(requestid.Middleware()(clientinfo.Middleware(clientCfg)(api.Handler())), "audit")
 	if a.pubL, err = (&net.ListenConfig{}).Listen(ctx, "tcp", cfg.HTTP.Addr); err != nil {
 		return nil, fmt.Errorf("listen on the public address: %w", err)
 	}

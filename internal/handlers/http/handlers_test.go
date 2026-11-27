@@ -10,6 +10,7 @@ import (
 
 	"github.com/techorionai/constellation-audit/api/openapi"
 	httpapi "github.com/techorionai/constellation-audit/internal/handlers/http"
+	"github.com/techorionai/constellation-audit/resources/test/mock"
 )
 
 // fakeVerifier gives the principal of the bearer token value.
@@ -61,10 +62,10 @@ func TestU5_ScopeTable(t *testing.T) {
 		"reader":  {ID: "s1", Type: auth.PrincipalService, App: "reader", Scopes: []string{readScope}},
 		"noscope": {ID: "s2", Type: auth.PrincipalService, App: "noscope"},
 	}
-	h := httpapi.New(httpapi.Deps{Scopes: table, Verifier: verifier}).Handler()
+	h := newServer(t, table, verifier, &mock.Reader{}, &mock.Entries{}).Handler()
 	for route, path := range routes {
-		if rec := do(h, path, "reader"); rec.Code != http.StatusNotImplemented {
-			t.Fatalf("%s: status = %d, want 501", route, rec.Code)
+		if rec := do(h, path, "reader"); rec.Code != wantReader[route] {
+			t.Fatalf("%s: status = %d, want %d", route, rec.Code, wantReader[route])
 		}
 		rec := do(h, path, "noscope")
 		if rec.Code != http.StatusForbidden || !contains(rec.Body.String(), `"missingScopes":["`+readScope+`"]`) {
@@ -92,23 +93,6 @@ func TestU5_ScopeTable(t *testing.T) {
 	}
 	if _, err := httpapi.NewScopeTable([]byte("paths:\n  /v1/x:\n    get:\n      operationId: X_get\n      x-required-scopes: []\n")); err == nil {
 		t.Fatal("an operation with an empty x-required-scopes must be an error")
-	}
-}
-
-func TestNotImplementedProblem(t *testing.T) {
-	table, err := httpapi.NewScopeTable(openapi.Spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	h := httpapi.New(httpapi.Deps{Scopes: table, Verifier: fakeVerifier{
-		"reader": {ID: "s1", Type: auth.PrincipalService, App: "reader", Scopes: []string{readScope}},
-	}}).Handler()
-	rec := do(h, "/v1/audit-entries", "reader")
-	if rec.Code != http.StatusNotImplemented || rec.Header().Get("Content-Type") != "application/problem+json" {
-		t.Fatalf("status = %d, content type = %q", rec.Code, rec.Header().Get("Content-Type"))
-	}
-	if !contains(rec.Body.String(), `"code":"not_implemented"`) {
-		t.Fatalf("body = %s", rec.Body.String())
 	}
 }
 
