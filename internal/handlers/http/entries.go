@@ -92,6 +92,25 @@ type rawFilters struct {
 	TargetType, TargetID, RequestID, TraceID       *string
 }
 
+// checkSet rejects a filter that the request sets with an empty value. The
+// domain cannot see the difference between an empty value and a missing value,
+// so the handler does this check.
+func (r rawFilters) checkSet() error {
+	for _, c := range []struct {
+		param string
+		value *string
+	}{
+		{"service", r.Service}, {"action", r.Action}, {"result", r.Result}, {"actor", r.Actor},
+		{"actorType", r.ActorType}, {"act", r.Act}, {"targetType", r.TargetType}, {"targetId", r.TargetID},
+		{"requestId", r.RequestID}, {"traceId", r.TraceID},
+	} {
+		if c.value != nil && *c.value == "" {
+			return problems.InvalidParameter(c.param)
+		}
+	}
+	return nil
+}
+
 func str(p *string) string {
 	if p == nil {
 		return ""
@@ -179,7 +198,11 @@ func (s *Server) AuditEntriesList(ctx context.Context, req gen.AuditEntriesListR
 	if err != nil {
 		return nil, err
 	}
-	f := listFilters(req.Params).filters()
+	raw := listFilters(req.Params)
+	if err := raw.checkSet(); err != nil {
+		return nil, err
+	}
+	f := raw.filters()
 	if err := f.Validate(); err != nil {
 		return nil, problems.FromFilter(err)
 	}
@@ -246,7 +269,11 @@ func (s *Server) AuditEntriesExport(ctx context.Context, req gen.AuditEntriesExp
 	if !req.Params.Format.Valid() {
 		return nil, problems.InvalidParameter("format")
 	}
-	f := exportFilters(req.Params).filters()
+	raw := exportFilters(req.Params)
+	if err := raw.checkSet(); err != nil {
+		return nil, err
+	}
+	f := raw.filters()
 	if err := f.Validate(); err != nil {
 		return nil, problems.FromFilter(err)
 	}

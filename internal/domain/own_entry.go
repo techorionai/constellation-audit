@@ -25,7 +25,8 @@ type ExportEntryInput struct {
 	EntryID string
 	// Time is the time of the decision.
 	Time time.Time
-	// Result is success, invalid (a 422), or denied (a 429).
+	// Result is success, failure (the body stopped), invalid (a 422), or denied
+	// (a 429).
 	Result string
 	// Actor and ActorType are the verified principal. Act and ActType are the
 	// act principal of the token, or empty.
@@ -33,8 +34,9 @@ type ExportEntryInput struct {
 	Act, ActType     string
 	Format           string
 	Filters          Filters
-	// Count is the number of entries of a successful export. MaxEntries is the
-	// limit that a 422 names.
+	// Count is the number of entries of a successful export, or the number of
+	// entries that a failed export read. MaxEntries is the limit that a 422
+	// names.
 	Count      int
 	MaxEntries int
 	// The request data. A value that breaks its rule is left out.
@@ -49,7 +51,7 @@ type ExportEntryInput struct {
 func NewExportEntry(in ExportEntryInput) (Entry, error) {
 	details := map[string]any{"format": in.Format, "filters": in.Filters.Set()}
 	switch in.Result {
-	case "success":
+	case "success", "failure":
 		details["count"] = in.Count
 	case "invalid":
 		details["maxEntries"] = in.MaxEntries

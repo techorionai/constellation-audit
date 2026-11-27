@@ -67,6 +67,8 @@ type Client struct {
 var clientSpecs = []Client{
 	{ID: "audit", App: "audit"},
 	{ID: "reader-svc", App: "reader", Roles: []string{"audit:reader"}},
+	{ID: "reader-svc-2", App: "reader_two", Roles: []string{"audit:reader"}},
+	{ID: "reader-svc-3", App: "reader_three", Roles: []string{"audit:reader"}},
 	{ID: "noroles-svc", App: "noroles"},
 }
 

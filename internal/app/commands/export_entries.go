@@ -20,7 +20,17 @@ import (
 // Export constants.
 const (
 	// ExportBatch is the number of entries that one read of an export returns.
-	ExportBatch = 1000
+	// An entry has a maximum of 64 KiB, so one batch has a maximum of 6.4 MiB.
+	ExportBatch = 100
+	// OwnEntryTimeout is the time limit to store the own audit entry of a
+	// request.
+	OwnEntryTimeout = 10 * time.Second
+	// deniedEvery is the shortest time between two denied entries of one
+	// principal.
+	deniedEvery = time.Minute
+	// maxDeniedPrincipals is the size of the map of the last denied entries.
+	// A larger map drops the old values.
+	maxDeniedPrincipals = 1024
 	// ExportRetryAfter is the Retry-After value of a 429 answer.
 	ExportRetryAfter = 10 * time.Second
 	// MetricExport is the name of the counter of the exports.
@@ -36,6 +46,7 @@ const (
 	outcomeBusy         = "busy"
 	outcomeError        = "error"
 	resultSuccess       = "success"
+	resultFailure       = "failure"
 	resultInvalidExport = "invalid"
 	resultDeniedExport  = "denied"
 )
@@ -70,6 +81,8 @@ type ExportStream struct {
 	// Count is the number of entries of the export.
 	Count int
 
+	sent int
+
 	session entries.ExportSession
 	h       *ExportEntriesHandler
 	cmd     ExportEntries
@@ -78,19 +91,24 @@ type ExportStream struct {
 
 // Next returns the next batch of entries. An empty result is the end.
 func (s *ExportStream) Next(ctx context.Context) ([]domain.StoredEntry, error) {
-	return s.session.Next(ctx, ExportBatch)
+	batch, err := s.session.Next(ctx, ExportBatch)
+	s.sent += len(batch)
+	return batch, err
 }
 
 // Finish ends the snapshot, frees the slot, and counts the export. err is the
-// error that stopped the body, or nil.
+// error that stopped the body, or nil. If err is not nil, Finish also writes a
+// second own audit entry with the result failure and the number of entries
+// that the export read before it stopped.
 func (s *ExportStream) Finish(ctx context.Context, err error) {
 	s.once.Do(func() {
 		s.session.Close(ctx)
-		<-s.h.slots
 		outcome := outcomeOK
 		if err != nil {
 			outcome = outcomeError
+			s.h.record(ctx, s.cmd, resultFailure, s.sent)
 		}
+		s.h.release(s.cmd.Principal.ID)
 		s.h.finish(ctx, s.cmd, outcome, s.Count)
 	})
 }
@@ -101,6 +119,9 @@ type ExportEntriesHandler struct {
 	writer     entries.Repository
 	maxEntries int
 	slots      chan struct{}
+	mu         sync.Mutex
+	active     map[string]struct{}
+	denied     map[string]time.Time
 	log        *slog.Logger
 	counter    metric.Int64Counter
 	now        func() time.Time
@@ -128,6 +149,7 @@ func NewExportEntries(reader entries.Reader, writer entries.Repository, meter me
 	}
 	h := &ExportEntriesHandler{
 		reader: reader, writer: writer, maxEntries: maxEntries, slots: make(chan struct{}, concurrency),
+		active: map[string]struct{}{}, denied: map[string]time.Time{},
 		log: log, counter: counter, now: time.Now,
 		newID: func() string {
 			id, err := uuid.NewV7()
@@ -145,28 +167,76 @@ func NewExportEntries(reader entries.Reader, writer entries.Repository, meter me
 
 // Execute checks the limits, writes the own audit entry, and returns the
 // stream of the entries. It gives the 429 problem too_many_exports with no free
-// slot, the 422 problem export_too_large with too many entries, and the 503
+// slot or if the principal has an export already, the 422 problem export_too_large with too many entries, and the 503
 // problem if the store is not available. A 429 and a 422 also write an own
-// audit entry, with the result denied and invalid.
+// audit entry, with the result denied and invalid. A principal gets a denied
+// entry once in each minute.
 //
 // No log record of this command has a filter value or an entry.
 func (h *ExportEntriesHandler) Execute(ctx context.Context, cmd ExportEntries) (*ExportStream, error) {
 	if err := cmd.Filters.Validate(); err != nil {
 		return nil, problems.FromFilter(err)
 	}
-	select {
-	case h.slots <- struct{}{}:
-	default:
-		h.record(ctx, cmd, resultDeniedExport, 0)
+	if !h.acquire(cmd.Principal.ID) {
+		h.recordDenied(ctx, cmd)
 		h.finish(ctx, cmd, outcomeBusy, 0)
 		return nil, apperrors.NewTooManyRequests(CodeTooManyExports, "Too many exports run now. Try again later.", ExportRetryAfter)
 	}
 	stream, err := h.start(ctx, cmd)
 	if err != nil {
-		<-h.slots
+		h.release(cmd.Principal.ID)
 		return nil, err
 	}
 	return stream, nil
+}
+
+// acquire takes a slot for the principal. It fails if no slot is free or if the
+// principal has an export already.
+func (h *ExportEntriesHandler) acquire(principal string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, ok := h.active[principal]; ok {
+		return false
+	}
+	select {
+	case h.slots <- struct{}{}:
+		h.active[principal] = struct{}{}
+		return true
+	default:
+		return false
+	}
+}
+
+// release frees the slot of the principal.
+func (h *ExportEntriesHandler) release(principal string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.active, principal)
+	<-h.slots
+}
+
+// recordDenied writes the denied entry, but not more than once in each
+// deniedEvery for one principal.
+func (h *ExportEntriesHandler) recordDenied(ctx context.Context, cmd ExportEntries) {
+	now := h.now()
+	h.mu.Lock()
+	if last, ok := h.denied[cmd.Principal.ID]; ok && now.Sub(last) < deniedEvery {
+		h.mu.Unlock()
+		return
+	}
+	if len(h.denied) >= maxDeniedPrincipals {
+		for k, v := range h.denied {
+			if now.Sub(v) >= deniedEvery {
+				delete(h.denied, k)
+			}
+		}
+		if len(h.denied) >= maxDeniedPrincipals {
+			clear(h.denied)
+		}
+	}
+	h.denied[cmd.Principal.ID] = now
+	h.mu.Unlock()
+	h.record(ctx, cmd, resultDeniedExport, 0)
 }
 
 func (h *ExportEntriesHandler) start(ctx context.Context, cmd ExportEntries) (*ExportStream, error) {
@@ -191,7 +261,12 @@ func (h *ExportEntriesHandler) start(ctx context.Context, cmd ExportEntries) (*E
 	if err := h.write(ctx, cmd, resultSuccess, count); err != nil {
 		session.Close(ctx)
 		h.finish(ctx, cmd, outcomeError, count)
-		return nil, apperrors.NewUnavailable()
+		// A store that is not available gives 503. Other errors give 500,
+		// because a retry cannot fix them.
+		if errors.Is(err, entries.ErrUnavailable) {
+			return nil, apperrors.NewUnavailable()
+		}
+		return nil, err
 	}
 	return &ExportStream{Count: count, session: session, h: h, cmd: cmd}, nil
 }
@@ -208,8 +283,11 @@ func (h *ExportEntriesHandler) write(ctx context.Context, cmd ExportEntries, res
 	if err != nil {
 		return err
 	}
-	// The write must finish when the client goes away.
-	_, err = h.writer.Insert(context.WithoutCancel(ctx), e)
+	// The write must finish when the client goes away. It has a time limit,
+	// because the export keeps its slot while the write runs.
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), OwnEntryTimeout)
+	defer cancel()
+	_, err = h.writer.Insert(wctx, e)
 	return err
 }
 

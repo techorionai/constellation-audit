@@ -64,7 +64,7 @@ func sample(seq int64, summary string) domain.StoredEntry {
 		Seq: seq, ReceivedAt: time.Date(2026, 11, 27, 10, 0, 1, 0, time.UTC),
 		Entry: domain.Entry{
 			ID: entryID, Service: "helpdesk", Time: time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC), Action: "helpdesk:ticket:write",
-			Result: "success", Actor: "usr_1", ActorType: "user", Summary: summary, Details: []byte(`{"n":12345678901234567890}`),
+			Result: "success", Actor: "usr_1", ActorType: "user", Summary: summary, Details: []byte(`{"n": 12345678901234567890, "a": [1, 2]}`),
 		},
 	}
 }
@@ -135,6 +135,13 @@ func TestU10_RequestErrors(t *testing.T) {
 		{"/v1/audit-entries?service=a&service=b", 400, "invalid_parameter"},
 		{"/v1/audit-entries/" + entryID + "?service=Bad-App", 400, "invalid_parameter"},
 		{"/v1/audit-entries?pageToken=zzz", 400, "invalid_page_token"},
+		{"/v1/audit-entries?actor=", 400, "invalid_parameter"},
+		{"/v1/audit-entries?act=", 400, "invalid_parameter"},
+		{"/v1/audit-entries?requestId=", 400, "invalid_parameter"},
+		{"/v1/audit-entries?targetId=&targetType=ticket", 400, "invalid_parameter"},
+		{"/v1/audit-entries?service=", 400, "invalid_parameter"},
+		{"/v1/audit-entries?result=", 400, "invalid_parameter"},
+		{"/v1/audit-entries/export?format=csv&actor=", 400, "invalid_parameter"},
 		{"/v1/audit-entries?pageSize=1", 200, ""},
 		{"/v1/audit-entries?pageSize=200", 200, ""},
 	}
@@ -249,7 +256,7 @@ func TestU5_CSVWriter(t *testing.T) {
 			t.Fatalf("row %d summary = %q, want %q", i+1, rows[i+1][summaryCol], w)
 		}
 	}
-	if rows[1][0] != entryID || rows[1][2] != "2026-11-27T10:00:00Z" || rows[1][17] != `{"n":12345678901234567890}` || rows[1][8] != "" {
+	if rows[1][0] != entryID || rows[1][2] != "2026-11-27T10:00:00Z" || rows[1][17] != `{"n":12345678901234567890,"a":[1,2]}` || rows[1][8] != "" {
 		t.Fatalf("row 1 = %q", rows[1])
 	}
 	if len(writer.Inserted) != 1 || writer.Inserted[0].Actor != "svc_reader" {
@@ -299,5 +306,33 @@ func TestExportProblems(t *testing.T) {
 	rec = get(readerServer(t, failing, &mock.Entries{}), "/v1/audit-entries/export?format=json")
 	if rec.Code != 503 || rec.Header().Get("Retry-After") != "5" {
 		t.Fatalf("status = %d, headers = %v", rec.Code, rec.Header())
+	}
+}
+
+// deadlineFail is a response writer whose write deadline cannot change.
+type deadlineFail struct{ *httptest.ResponseRecorder }
+
+func (deadlineFail) SetWriteDeadline(time.Time) error { return io.ErrClosedPipe }
+
+// R10: an error of SetWriteDeadline stops the export before the first byte,
+// frees the slot, and gives 500.
+func TestExportWriteDeadlineError(t *testing.T) {
+	session := &mock.Session{CountValue: 1, Batches: [][]domain.StoredEntry{{sample(1, "s")}}}
+	reader := &mock.Reader{BeginExportFunc: func(context.Context, domain.Filters) (entries.ExportSession, error) { return session, nil }}
+	writer := &mock.Entries{}
+	h := readerServer(t, reader, writer)
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/v1/audit-entries/export?format=csv", nil)
+	req.Header.Set("Authorization", "Bearer reader")
+	rec := deadlineFail{httptest.NewRecorder()}
+	h.ServeHTTP(rec, req)
+	if rec.Code != 500 || strings.Contains(rec.Body.String(), "svc_reader") {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if session.Closed() != 1 {
+		t.Fatalf("closed = %d", session.Closed())
+	}
+	// The own entry of the start and the failure entry.
+	if len(writer.Inserted) != 2 || writer.Inserted[1].Result != "failure" {
+		t.Fatalf("entries = %+v", writer.Inserted)
 	}
 }

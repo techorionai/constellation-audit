@@ -51,11 +51,11 @@ The generated code decodes the query and path parameters before the router calls
 ## Export flow
 
 1. The handler checks `format` and the filters.
-2. The command takes a slot of the limit `AUDIT_EXPORT__CONCURRENCY`. With no free slot: the own entry with the result `denied`, and 429.
+2. The command takes a slot of the limit `AUDIT_EXPORT__CONCURRENCY`. A principal can take one slot. With no free slot, or with a slot of the same principal: the own entry with the result `denied` (one in each minute for each principal), and 429.
 3. The adapter starts a `REPEATABLE READ READ ONLY` transaction and counts the matching entries, with a limit of the maximum plus one. Over the maximum: the own entry with the result `invalid`, and 422.
-4. The command writes the own entry with the result `success` on a second connection, in a short transaction. An error gives 503 and no data.
-5. The handler reads the first batch of 1000 entries and writes the headers. Then it writes the body as it reads the next batches from a server-side cursor.
-6. At the end, the command closes the transaction, frees the slot, and counts the export. An error after the first byte aborts the connection.
+4. The command writes the own entry with the result `success` on a second connection, in a short transaction with a time limit of 10 seconds. A store that is not available gives 503 and no data. Other errors give 500.
+5. The handler reads the first batch of 100 entries and writes the headers. Then it writes the body as it reads the next batches from a server-side cursor.
+6. At the end, the command closes the transaction, frees the slot, and counts the export. An error after the first byte writes a second own entry with the result `failure` and aborts the connection.
 
 ## Startup order
 

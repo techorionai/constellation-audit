@@ -146,3 +146,97 @@ func TestU6_ExportCommand(t *testing.T) {
 		_ = wantProblem(t, err, 400, "invalid_parameter")
 	})
 }
+
+// R2: the own entry insert has a time limit.
+func TestOwnEntryHasTimeout(t *testing.T) {
+	var limited bool
+	writer := &mock.Entries{InsertFunc: func(ctx context.Context, _ domain.Entry) (bool, error) {
+		_, limited = ctx.Deadline()
+		return true, nil
+	}}
+	h := exportHandler(t, &mock.Reader{}, writer, 10, 1)
+	stream, err := h.Execute(context.Background(), exportCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stream.Finish(context.Background(), nil)
+	if !limited {
+		t.Fatal("the insert has no time limit")
+	}
+}
+
+// R9: an error of the own entry that is not "unavailable" gives no 503.
+func TestOwnEntryErrorIsNot503(t *testing.T) {
+	writer := &mock.Entries{InsertFunc: func(context.Context, domain.Entry) (bool, error) { return false, errors.New("bad data") }}
+	h := exportHandler(t, &mock.Reader{}, writer, 10, 1)
+	_, err := h.Execute(context.Background(), exportCmd)
+	if err == nil {
+		t.Fatal("no error")
+	}
+	if _, ok := apperrors.AsProblem(err); ok {
+		t.Fatalf("error = %v, want an error that is not a problem (500)", err)
+	}
+}
+
+// R4: a body that stops writes a second entry with the result failure and the
+// number of entries that the export read.
+func TestFailureEntry(t *testing.T) {
+	ctx := context.Background()
+	writer := &mock.Entries{}
+	session := &mock.Session{CountValue: 5, Batches: [][]domain.StoredEntry{{{}, {}}, {{}}}}
+	h := exportHandler(t, &mock.Reader{BeginExportFunc: func(context.Context, domain.Filters) (entries.ExportSession, error) {
+		return session, nil
+	}}, writer, 10, 1)
+	stream, err := h.Execute(ctx, exportCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := stream.Next(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stream.Finish(ctx, errors.New("client gone"))
+	if len(writer.Inserted) != 2 || writer.Inserted[0].Result != "success" || writer.Inserted[1].Result != "failure" ||
+		!strings.Contains(string(writer.Inserted[1].Details), `"count":3`) {
+		t.Fatalf("entries = %+v", writer.Inserted)
+	}
+}
+
+// R7: one export for each principal, and one denied entry in each minute.
+func TestOnePrincipalOneExport(t *testing.T) {
+	ctx := context.Background()
+	writer := &mock.Entries{}
+	h := exportHandler(t, &mock.Reader{}, writer, 10, 3)
+	first, err := h.Execute(ctx, exportCmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		_, err = h.Execute(ctx, exportCmd)
+		_ = wantProblem(t, err, 429, "too_many_exports")
+	}
+	denied := 0
+	for _, e := range writer.Inserted {
+		if e.Result == "denied" {
+			denied++
+		}
+	}
+	if denied != 1 {
+		t.Fatalf("denied entries = %d, want 1", denied)
+	}
+	// Another principal has a free slot.
+	other := exportCmd
+	other.Principal = commands.Principal{ID: "svc_other", Type: "service"}
+	second, err := h.Execute(ctx, other)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second.Finish(ctx, nil)
+	first.Finish(ctx, nil)
+	again, err := h.Execute(ctx, exportCmd)
+	if err != nil {
+		t.Fatalf("the principal has no free slot after Finish: %v", err)
+	}
+	again.Finish(ctx, nil)
+}

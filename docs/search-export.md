@@ -49,20 +49,22 @@ Each text value must be valid UTF-8 and must not have the character U+0000. A va
 
 - The export uses the filters and the order of the list. It has no pages.
 - The service counts the matching entries first. More than `AUDIT_EXPORT__MAX_ENTRIES` entries (default 100000) give 422 `export_too_large`, before the first byte of data.
-- The service reads all entries in one `REPEATABLE READ READ ONLY` transaction with a server-side cursor, in batches of 1000. The count and the body come from the same snapshot. The service writes the body as it reads, so the memory use is small.
+- The service reads all entries in one `REPEATABLE READ READ ONLY` transaction with a server-side cursor, in batches of 100 entries. One batch has a maximum of 6.4 MiB, because an entry has a maximum of 64 KiB. The count and the body come from the same snapshot. The service writes the body as it reads, so the memory use is small.
 - The headers are `Content-Disposition: attachment; filename="audit-entries-<UTC time>.<csv or json>"`, for example `audit-entries-20261127T101500Z.csv`, and `X-Content-Type-Options: nosniff`.
-- The write deadline of the response is `AUDIT_EXPORT__TIMEOUT` (default 10 minutes), because a large export takes longer than the normal write timeout.
+- The service sets a write deadline of 30 seconds for each batch, because a large export takes longer than the normal write timeout. The total time of an export has the limit `AUDIT_EXPORT__TIMEOUT` (default 10 minutes). A client that reads too slowly stops the export.
 
 ### Limits
 
 An instance runs a maximum of `AUDIT_EXPORT__CONCURRENCY` exports at the same time. The default is 2, the value of the contract. An operator can change it from 1 to 16. A pool that has too few connections stops the service at start. See `configuration.md`. An export above the limit gives 429 `too_many_exports` with `Retry-After: 10`.
 
-The service does not set a limit for each principal.
+A principal can run one export at a time. A second export of the same principal gives 429 `too_many_exports`. The service writes one `denied` entry for each principal in each minute.
+
+A list query, a get query, and each batch of an export have a time limit of 15 seconds. The service runs a maximum of 4 list and get queries at the same time. A query that waits longer than the time limit gives 503 `unavailable`. This protects the connection pool of the intake.
 
 ### CSV
 
 - The file follows RFC 4180: the line end is `\r\n`, the first row is the header row, each cell is in double quotes, and a `"` in a cell is `""`.
-- The columns, in order: `id`, `service`, `time`, `receivedAt`, `action`, `result`, `actor`, `actorType`, `act`, `actType`, `targetType`, `targetId`, `summary`, `requestId`, `traceId`, `ipAddress`, `userAgent`, `details`. Times are in RFC 3339 form in UTC. `details` is JSON text. An optional value that is not set is an empty cell.
+- The columns, in order: `id`, `service`, `time`, `receivedAt`, `action`, `result`, `actor`, `actorType`, `act`, `actType`, `targetType`, `targetId`, `summary`, `requestId`, `traceId`, `ipAddress`, `userAgent`, `details`. Times are in RFC 3339 form in UTC. `details` is compact JSON text. An optional value that is not set is an empty cell.
 - A cell that starts with `=`, `+`, `-`, `@`, a tab, a carriage return, or a line feed gets a `'` in front. This rule applies to all columns. A spreadsheet then does not run the cell as a formula.
 
 ### JSON
@@ -71,7 +73,7 @@ The body is one JSON array of `AuditEntry` objects. The service writes `[`, then
 
 ### An error after the first byte
 
-The service reads the first batch before it writes the headers, so a database error at the start gives a normal Problem answer. After the first byte, the service cannot change the status. It logs the error and aborts the connection. The client sees an incomplete body and not a short file that looks complete. The client must not use an export that ends with an error.
+The service reads the first batch before it writes the headers, so a database error at the start gives a normal Problem answer. After the first byte, the service cannot change the status. It logs the error and aborts the connection. The client sees an incomplete body and not a short file that looks complete. The client must not use an export that ends with an error. The service then writes a second entry with the result `failure` and the number of entries that it read.
 
 ## The audit entry of an export
 
@@ -83,11 +85,11 @@ An export copies many entries out of the service. The service writes an audit en
 | `service` | `audit` |
 | `time` | The time of the decision. |
 | `action` | `audit:log:export` |
-| `result` | `success`. `invalid` for a 422. `denied` for a 429. |
+| `result` | `success`. `failure` if the body stops after the first byte. `invalid` for a 422. `denied` for a 429. |
 | `actor`, `actor_type` | The subject and the type of the verified principal. |
 | `act`, `act_type` | The `act` principal of the token, if set. |
 | `summary` | `Export of audit entries` |
-| `details` | `format`, `filters` (only the set filters), and `count`. A 422 has `maxEntries` in place of `count`. |
+| `details` | `format`, `filters` (only the set filters), and `count`. A `failure` entry has the number of entries that the export read in `count`. A 422 has `maxEntries` in place of `count`. |
 | `request_id` | The `X-Request-ID` of the request, if it matches `^[A-Za-z0-9._-]{1,128}$`. |
 | `trace_id` | The trace ID of the request, if the request has a valid trace. |
 | `ip_address` | The client address from the `clientinfo` middleware, if it is valid and has no zone. |

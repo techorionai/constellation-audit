@@ -355,7 +355,7 @@ func TestSearchI5_ExportCSV(t *testing.T) {
 	if strings.Join(rows[0], ",") != "id,service,time,receivedAt,action,result,actor,actorType,act,actType,targetType,targetId,summary,requestId,traceId,ipAddress,userAgent,details" {
 		t.Fatalf("header = %v", rows[0])
 	}
-	if rows[1][12] != "'=cmd" || rows[2][12] != "second" || rows[3][12] != "third" || rows[1][1] != "helpdesk" || rows[1][10] != "ticket" || rows[1][17] != `{"k": "v"}` {
+	if rows[1][12] != "'=cmd" || rows[2][12] != "second" || rows[3][12] != "third" || rows[1][1] != "helpdesk" || rows[1][10] != "ticket" || rows[1][17] != `{"k":"v"}` {
 		t.Fatalf("rows = %q", rows)
 	}
 	var count int
@@ -434,27 +434,39 @@ func countJSON(r io.Reader) (int, error) {
 	return n, err
 }
 
-// I8 of issue 2 (test SI8): concurrency 2. 2 exports of 5000 large entries run, and the clients do
-// not read the body, so the server blocks on the write. A third export gives
-// 429. Then the clients read the 2 bodies.
+// I8 of issue 2 (test SI8): concurrency 2. 2 exports of 5000 large entries run
+// for 2 principals, and the clients do not read the body, so the server blocks
+// on the write. An export of a third principal gives 429 (no free slot). A
+// second export of the first principal also gives 429 (one export for each
+// principal), and its denied entry is not written again in the same minute.
+// Then the clients read the 2 bodies.
 func TestSearchI8_ExportConcurrency(t *testing.T) {
 	srv := started(t)
 	p := pool(t, srv.DB)
 	seedBulk(t, p, "helpdesk", 5000, time.Now().UTC().Add(-time.Hour), 1000, 15000)
 	token := readToken(t)
+	token2 := env.Token(t, "reader-svc-2", "audit", readScope)
+	token3 := env.Token(t, "reader-svc-3", "audit", readScope)
 	a := srv.Open(t, exportPath+"?format=json&service=helpdesk", token, nil)
 	defer func() { _ = a.Body.Close() }()
-	b := srv.Open(t, exportPath+"?format=json&service=helpdesk", token, nil)
+	b := srv.Open(t, exportPath+"?format=json&service=helpdesk", token2, nil)
 	defer func() { _ = b.Body.Close() }()
 	if a.StatusCode != http.StatusOK || b.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d and %d", a.StatusCode, b.StatusCode)
 	}
-	third := srv.Do(t, http.MethodGet, exportPath+"?format=json&service=helpdesk", token, nil)
+	third := srv.Do(t, http.MethodGet, exportPath+"?format=json&service=helpdesk", token3, nil)
 	if third.Status != http.StatusTooManyRequests || third.Code(t) != "too_many_exports" || third.Header.Get("Retry-After") != "10" {
 		t.Fatalf("third: status = %d, headers = %v, body = %s", third.Status, third.Header, third.Body)
 	}
-	if got := count(t, p, `SELECT count(*) FROM audit_entries WHERE action = 'audit:log:export' AND result = 'denied'`); got != 1 {
-		t.Fatalf("denied entries = %d, want 1", got)
+	for range 3 {
+		again := srv.Do(t, http.MethodGet, exportPath+"?format=json&service=helpdesk", token, nil)
+		if again.Status != http.StatusTooManyRequests || again.Code(t) != "too_many_exports" {
+			t.Fatalf("second export of one principal: status = %d, body = %s", again.Status, again.Body)
+		}
+	}
+	// One denied entry for each principal in each minute: 2 in all.
+	if got := count(t, p, `SELECT count(*) FROM audit_entries WHERE action = 'audit:log:export' AND result = 'denied'`); got != 2 {
+		t.Fatalf("denied entries = %d, want 2", got)
 	}
 	var wg sync.WaitGroup
 	counts := make([]int, 2)

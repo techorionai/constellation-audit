@@ -22,6 +22,31 @@ const selectColumns = `id, entry_id::text, service, time, received_at, action, r
 
 const order = ` ORDER BY time DESC, id DESC`
 
+// Limits of the read queries.
+const (
+	// ReadTimeout is the time limit of one list query, one get query, one
+	// count query of an export, and one batch of an export. It includes the
+	// wait for a free read slot.
+	ReadTimeout = 15 * time.Second
+	// MaxParallelReads is the number of list and get queries that run at the
+	// same time.
+	MaxParallelReads = 4
+)
+
+// beginRead waits for a free read slot, and returns a context with the time
+// limit. The caller must call done. A wait that is longer than the limit gives
+// entries.ErrUnavailable.
+func (r *Entries) beginRead(ctx context.Context, op string) (context.Context, func(), error) {
+	ctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+	select {
+	case r.reads <- struct{}{}:
+		return ctx, func() { <-r.reads; cancel() }, nil
+	case <-ctx.Done():
+		cancel()
+		return nil, nil, fmt.Errorf("%s: %w", op, entries.ErrUnavailable)
+	}
+}
+
 // where builds the WHERE clause of the filters and the cursor. It returns the
 // clause (with a leading space, or empty) and the arguments.
 func where(f domain.Filters, after *domain.Cursor) (string, []any) {
@@ -102,6 +127,11 @@ func collect(op string, rows pgx.Rows) ([]domain.StoredEntry, error) {
 
 // Search returns a page of entries. The query uses the keyset (time, id).
 func (r *Entries) Search(ctx context.Context, f domain.Filters, after *domain.Cursor, limit int) ([]domain.StoredEntry, error) {
+	ctx, done, err := r.beginRead(ctx, "search audit entries")
+	if err != nil {
+		return nil, err
+	}
+	defer done()
 	clause, args := where(f, after)
 	args = append(args, limit)
 	rows, err := r.pool.Query(ctx, `SELECT `+selectColumns+` FROM audit_entries`+clause+order+` LIMIT $`+strconv.Itoa(len(args)), args...)
@@ -115,6 +145,11 @@ func (r *Entries) Search(ctx context.Context, f domain.Filters, after *domain.Cu
 // Without a service, it returns the entry with the oldest receipt time, then
 // the smallest internal key.
 func (r *Entries) Get(ctx context.Context, id, service string) (domain.StoredEntry, error) {
+	ctx, done, err := r.beginRead(ctx, "get audit entry")
+	if err != nil {
+		return domain.StoredEntry{}, err
+	}
+	defer done()
 	q := `SELECT ` + selectColumns + ` FROM audit_entries WHERE entry_id = $1::uuid`
 	args := []any{id}
 	if service != "" {
@@ -152,6 +187,8 @@ func (r *Entries) BeginExport(ctx context.Context, f domain.Filters) (entries.Ex
 }
 
 func (s *exportSession) Count(ctx context.Context, limit int) (int, error) {
+	ctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+	defer cancel()
 	clause, args := where(s.f, nil)
 	args = append(args, limit)
 	var n int
@@ -163,6 +200,8 @@ func (s *exportSession) Count(ctx context.Context, limit int) (int, error) {
 }
 
 func (s *exportSession) Next(ctx context.Context, n int) ([]domain.StoredEntry, error) {
+	ctx, cancel := context.WithTimeout(ctx, ReadTimeout)
+	defer cancel()
 	if !s.declared {
 		clause, args := where(s.f, nil)
 		_, err := s.tx.Exec(ctx, `DECLARE `+exportCursor+` NO SCROLL CURSOR FOR SELECT `+selectColumns+` FROM audit_entries`+clause+order, args...)

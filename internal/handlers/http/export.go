@@ -2,8 +2,11 @@ package httpapi
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -56,11 +59,21 @@ func csvRow(w io.Writer, cells []string) error {
 	return err
 }
 
+// compactDetails returns the details as compact JSON text. The jsonb text of
+// the store has spaces. The input is valid JSON, and the fallback is the input.
+func compactDetails(d []byte) string {
+	var b bytes.Buffer
+	if err := json.Compact(&b, d); err != nil {
+		return string(d)
+	}
+	return b.String()
+}
+
 func csvCells(e domain.StoredEntry) []string {
 	return []string{
 		e.ID, e.Service, e.Time.UTC().Format(time.RFC3339Nano), e.ReceivedAt.UTC().Format(time.RFC3339Nano),
 		e.Action, e.Result, e.Actor, e.ActorType, e.Act, e.ActType, e.TargetType, e.TargetID, e.Summary,
-		e.RequestID, e.TraceID, e.IPAddress, e.UserAgent, string(e.Details),
+		e.RequestID, e.TraceID, e.IPAddress, e.UserAgent, compactDetails(e.Details),
 	}
 }
 
@@ -106,12 +119,39 @@ type bodyWriter interface {
 	end() error
 }
 
+// batchTimeout is the time limit to write one batch of an export. A client that
+// reads more slowly stops the export. The total time limit is ExportTimeout.
+const batchTimeout = 30 * time.Second
+
+// errExportTimeout means that an export is longer than the total time limit.
+var errExportTimeout = errors.New("the export is longer than the time limit")
+
 // exportResponse is the response of an export. It streams the body.
 type exportResponse struct {
 	ctx    context.Context //nolint:containedctx // The strict handler gives the context at the call of the operation only.
 	s      *Server
 	stream *commands.ExportStream
 	format gen.AuditExportFormat
+	// end is the time when the export must end.
+	end time.Time
+}
+
+// setDeadline sets the write deadline of the next batch. It is the smaller of
+// batchTimeout from now and the end of the export. A response writer that has
+// no write deadline (for example a test recorder) is not an error.
+func (r *exportResponse) setDeadline(rc *http.ResponseController) error {
+	now := time.Now()
+	if !now.Before(r.end) {
+		return errExportTimeout
+	}
+	d := now.Add(batchTimeout)
+	if d.After(r.end) {
+		d = r.end
+	}
+	if err := rc.SetWriteDeadline(d); err != nil && !errors.Is(err, http.ErrNotSupported) {
+		return fmt.Errorf("set the write deadline: %w", err)
+	}
+	return nil
 }
 
 // VisitAuditEntriesExportResponse writes the headers and the body. The first
@@ -125,8 +165,14 @@ func (r *exportResponse) VisitAuditEntriesExportResponse(w http.ResponseWriter) 
 		r.stream.Finish(r.ctx, err)
 		return problems.FromStore(err)
 	}
-	// A large export takes longer than the write timeout of the server.
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(r.s.d.ExportTimeout))
+	// A large export takes longer than the write timeout of the server. Each
+	// batch has its own deadline, and the total time has a limit.
+	rc := http.NewResponseController(w)
+	r.end = time.Now().Add(r.s.d.ExportTimeout)
+	if err := r.setDeadline(rc); err != nil {
+		r.stream.Finish(r.ctx, err)
+		return err
+	}
 
 	ext, contentType := "csv", "text/csv"
 	if r.format == gen.Json {
@@ -145,7 +191,7 @@ func (r *exportResponse) VisitAuditEntriesExportResponse(w http.ResponseWriter) 
 	if r.format == gen.Json {
 		body = jsonWriter{bw}
 	}
-	err = r.write(bw, body, first)
+	err = r.write(rc, bw, body, first)
 	r.stream.Finish(r.ctx, err)
 	if err != nil {
 		r.s.log.ErrorContext(r.ctx, "an export stopped after the first byte", "error", err)
@@ -154,7 +200,7 @@ func (r *exportResponse) VisitAuditEntriesExportResponse(w http.ResponseWriter) 
 	return nil
 }
 
-func (r *exportResponse) write(bw *bufio.Writer, body bodyWriter, batch []domain.StoredEntry) error {
+func (r *exportResponse) write(rc *http.ResponseController, bw *bufio.Writer, body bodyWriter, batch []domain.StoredEntry) error {
 	if err := body.start(); err != nil {
 		return err
 	}
@@ -165,6 +211,9 @@ func (r *exportResponse) write(bw *bufio.Writer, body bodyWriter, batch []domain
 				return err
 			}
 			n++
+		}
+		if err := r.setDeadline(rc); err != nil {
+			return err
 		}
 		var err error
 		if batch, err = r.stream.Next(r.ctx); err != nil {
