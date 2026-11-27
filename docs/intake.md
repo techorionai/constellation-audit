@@ -27,6 +27,10 @@ The service of a stored entry is always the app of the stream key. The app of th
 
 `store_refused` means that PostgreSQL refused the data with an error of class 22 (data exception) and the checks did not find the reason. A retry cannot fix such an entry. Errors of the classes 08 and 53 mean that the store is not available. The entry stays pending.
 
+## Delivery after an error
+
+A pending message comes again after the claim idle time of platform-go, 5 minutes by default. After a stop of PostgreSQL, the entries of that time are thus stored up to 5 minutes after the return of the database. No entry is lost, because the group keeps the message until the handler acknowledges it.
+
 ## Rejected entries
 
 An entry that fails a check goes to the table `rejected_entries`. The row has the stream, the stream ID, the event ID (if any), the reason code, and the raw payload. The insert uses `ON CONFLICT (stream, stream_id) DO NOTHING`, and the handler then acknowledges the message. A second delivery of the same message gives no error. The retention job deletes old rows (see `retention.md`).
