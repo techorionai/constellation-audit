@@ -39,7 +39,11 @@ The service stops at start with a message that names the variable when a rule fa
 The Valkey user of the audit service needs the key pattern `~audit:*` and the command rule of platform-go. It also needs the two selectors of `streamsvalkey.AuditReaderSelectors()`:
 
 - the audit streams `audit.stream:*`: `+xreadgroup +xack +xautoclaim +xpending +xinfo|groups +xinfo|stream +xinfo|consumers +xgroup|create +xgroup|createconsumer +xgroup|delconsumer +xrange`,
-- the set `audit.streams`: `+sscan`.
+- the set `audit.streams`: `+sscan +srem`.
+
+The command `SREM` lets `AuditApps` delete forged members from `audit.streams`. If the reader user has no `+srem`, the service still works, and the forged members stay in the set. The first `SREM` call gives a `NOPERM` error, and `AuditApps` goes on without deletes. Another `SREM` error stops the call, and the supervisor counts the problem `apps_error`.
+
+Without `+srem`, each refresh reads the forged members again, to a maximum of 10000 members for each call. If the set has more members, each refresh gives `too_many_apps`. The table `known_apps` protects the known apps, and a new producer can stay hidden. To check the ACL, run `ACL DRYRUN <reader user> SREM audit.streams x`. It must return `OK`. The update of `constellation-deploy` adds `+srem`.
 
 Give these selectors only to the audit service user. A producer user gets the selectors of `streamsvalkey.AuditProducerSelectors(app)`. They give no read access.
 
